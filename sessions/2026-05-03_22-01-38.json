@@ -1,0 +1,29 @@
+{
+  "started_at": "2026-05-03T22:01:38.867048",
+  "events": [
+    {
+      "type": "message",
+      "role": "user",
+      "text": "Hola",
+      "timestamp": "2026-05-03T22:01:52.927985"
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "text": "¡Hola! ¿En qué puedo ayudarte hoy con tu terminal de Linux?",
+      "timestamp": "2026-05-03T22:01:55.185250"
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "text": "podes hacer sonidos",
+      "timestamp": "2026-05-03T22:02:20.424580"
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "text": "No puedo hacer sonidos directamente, pero puedo ayudarte a ejecutar comandos que reproduzcan sonido en tu sistema. Por ejemplo, usando herramientas de línea de comandos como `aplay` para archivos WAV o `mplayer` para otros formatos de audio. ¿Tienes algún archivo de audio que te gustaría reproducir?",
+      "timestamp": "2026-05-03T22:02:22.418189"
+    }
+  ]
+}

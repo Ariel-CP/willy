@@ -1,0 +1,17 @@
+{
+  "started_at": "2026-05-03T22:25:09.499226",
+  "events": [
+    {
+      "type": "message",
+      "role": "user",
+      "text": "como estara el estado del tiempo mañana",
+      "timestamp": "2026-05-03T22:26:11.809834"
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "text": "No tengo acceso directo a servicios de pronóstico del tiempo actual. Te recomiendo que uses un sitio web confiable de pronóstico del tiempo o una aplicación móvil para obtener la información más reciente sobre el estado del tiempo para mañana en tu ubicación.",
+      "timestamp": "2026-05-03T22:26:14.900560"
+    }
+  ]
+}

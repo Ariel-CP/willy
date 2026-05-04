@@ -1,0 +1,17 @@
+{
+  "started_at": "2026-05-03T21:51:18.054034",
+  "events": [
+    {
+      "type": "message",
+      "role": "user",
+      "text": "Hola",
+      "timestamp": "2026-05-03T21:51:34.464563"
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "text": "¡Hola! ¿En qué puedo ayudarte hoy?",
+      "timestamp": "2026-05-03T21:51:37.050700"
+    }
+  ]
+}
