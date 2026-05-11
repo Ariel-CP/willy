@@ -2,16 +2,19 @@
 ai_agent.py — OpenAI client with tool/function calling for terminal operations.
 """
 
+import html
 import json
 import os
 import threading
-import urllib.request
 import urllib.parse
+import urllib.request
 from datetime import datetime
+from html.parser import HTMLParser
 from typing import Callable, Optional
 
 import openai
 from app import i18n
+from app.iot_diagram_manager import IoTDiagramManager
 
 # ---------------------------------------------------------------------------
 # Tool schemas
@@ -118,27 +121,237 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location using wttr.in.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City or location name, e.g. Madrid.",
+                    },
+                    "lang": {
+                        "type": "string",
+                        "description": "Language code for the weather response, e.g. es or en.",
+                        "default": "es",
+                    },
+                },
+                "required": ["location"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web for relevant pages and return top results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query to look up on the web.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of links to return (1-10).",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_webpage",
+            "description": "Fetch a webpage URL and return readable text content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The webpage URL to fetch.",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum number of characters to return.",
+                        "default": 12000,
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "detect_microcontroller",
+            "description": "Detect connected Arduino, ESP32, or other microcontroller boards. Returns port, description, and board type.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "build_microcontroller",
+            "description": "Compile an Arduino/ESP32 project using PlatformIO. Requires a platformio.ini in the project directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to the PlatformIO project directory.",
+                    },
+                    "env": {
+                        "type": "string",
+                        "description": "Target environment (e.g., esp32, arduino). If not specified, uses default from platformio.ini.",
+                    },
+                },
+                "required": ["project_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "upload_microcontroller",
+            "description": "Build and upload firmware to a connected microcontroller board via serial port. Requires PlatformIO.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to the PlatformIO project directory.",
+                    },
+                    "port": {
+                        "type": "string",
+                        "description": "Serial port (e.g., /dev/ttyUSB0). If not specified, uses default from config.",
+                    },
+                    "env": {
+                        "type": "string",
+                        "description": "Target environment (e.g., esp32, arduino).",
+                    },
+                },
+                "required": ["project_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_iot_schematic",
+            "description": "Generate an IoT electronic schematic diagram (PNG/SVG) and BOM from components and connections.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Project title, e.g. Greenhouse Monitor.",
+                    },
+                    "board": {
+                        "type": "string",
+                        "description": "Main board/controller, e.g. esp32.",
+                    },
+                    "components": {
+                        "type": "array",
+                        "description": "List of electronic components.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "type": {"type": "string"},
+                                "label": {"type": "string"},
+                                "value": {"type": "string"},
+                                "notes": {"type": "string"},
+                            },
+                        },
+                    },
+                    "connections": {
+                        "type": "array",
+                        "description": "Net connections between pins/components.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": {"type": "string"},
+                                "to": {"type": "string"},
+                                "signal": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+                "required": ["title", "board", "components"],
+            },
+        },
+    },
 ]
 
-SYSTEM_PROMPT = """You are Willy, an intelligent AI assistant fully integrated with the user's Linux (Lubuntu) terminal.
+SYSTEM_PROMPT = """You are Willy, an intelligent AI assistant and IoT programming specialist fully integrated with the user's Linux (Lubuntu) terminal.
 
 You have access to the following tools:
+
+**General Tools:**
 - run_command: execute any shell command
 - read_file: read a file's contents
 - write_file: create or edit a file
 - list_directory: list directory contents
 - get_weather: get current weather for any city via wttr.in
+- search_web: search the internet and return relevant links
+- fetch_webpage: fetch and summarize readable text from a webpage URL
+
+**IoT & Embedded Systems Tools:**
+- detect_microcontroller: detect connected Arduino, ESP32, or other microcontroller boards
+- build_microcontroller: compile Arduino/ESP32 projects using PlatformIO
+- upload_microcontroller: build and upload firmware to a connected microcontroller
+- generate_iot_schematic: create an electronic schematic diagram (PNG/SVG) and BOM
 
 Guidelines:
-- When asked to do something that requires terminal interaction, use the appropriate tool.
+- When asked about microcontrollers (Arduino, ESP32, etc.), prefer using IoT tools (detect, build, upload).
+- When asked to design a circuit, wiring, or component diagram, use generate_iot_schematic.
+- For terminal commands, use run_command. For file operations, use read_file/write_file.
 - For commands that could be destructive (rm, sudo, overwriting files, etc.), briefly explain what you are about to do before the tool call. The UI will ask the user for confirmation.
-- For read-only operations (ls, cat, pwd, etc.) you can proceed directly.
-- Always show the output of commands to the user in your response.
+- For read-only operations (ls, cat, pwd, search_web, fetch_webpage, detect_microcontroller, etc.) you can proceed directly.
+- Always show relevant command or tool output to the user in your response.
+- When using web data, include source URLs in your final answer.
 - Be concise and helpful. Respond in the same language the user uses.
-- If a command fails, analyze the error output and suggest a fix.
+- If a tool or command fails, analyze the error output and suggest a fix.
 """
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "willy_tool_errors.log")
+
+
+class _TextExtractor(HTMLParser):
+    """Extract visible text from HTML while ignoring scripts/styles."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._skip_depth = 0
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
+        if tag in {"script", "style", "noscript"}:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript"} and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            text = data.strip()
+            if text:
+                self._parts.append(text)
+
+    def text(self) -> str:
+        return "\n".join(self._parts)
 
 
 class AIAgent:
@@ -149,6 +362,7 @@ class AIAgent:
         on_message: Callable[[str, str], None],
         on_confirm_request: Callable[[str, str, Callable], None],
         on_status: Callable[[str], None],
+        arduino_manager=None,
     ):
         """
         Parameters
@@ -158,12 +372,15 @@ class AIAgent:
         on_message          : callback(role, text) — add a message to chat
         on_confirm_request  : callback(title, detail, proceed_fn) — ask user to confirm
         on_status           : callback(status_text) — update status bar
+        arduino_manager     : ArduinoManager instance (optional)
         """
         self.config = config
         self.tm = terminal_manager
         self.on_message = on_message
         self.on_confirm = on_confirm_request
         self.on_status = on_status
+        self.arduino_manager = arduino_manager
+        self.diagram_manager = IoTDiagramManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
         self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         self._client: Optional[openai.OpenAI] = None
 
@@ -304,6 +521,12 @@ class AIAgent:
             "list_directory": self._tool_list_directory,
             "change_directory": self._tool_change_directory,
             "get_weather": self._tool_get_weather,
+            "search_web": self._tool_search_web,
+            "fetch_webpage": self._tool_fetch_webpage,
+            "detect_microcontroller": self._tool_detect_microcontroller,
+            "build_microcontroller": self._tool_build_microcontroller,
+            "upload_microcontroller": self._tool_upload_microcontroller,
+            "generate_iot_schematic": self._tool_generate_iot_schematic,
         }
         handler = dispatch.get(name)
         if handler is None:
@@ -456,6 +679,109 @@ class AIAgent:
         except Exception as exc:
             return f"Error obteniendo el clima: {exc}"
 
+    def _tool_search_web(self, args: dict) -> str:
+        query = args.get("query", "").strip()
+        if not query:
+            return "Error: query is required."
+
+        requested = args.get("max_results", 5)
+        try:
+            max_results = int(requested)
+        except (TypeError, ValueError):
+            max_results = 5
+        max_results = max(1, min(max_results, 10))
+
+        try:
+            encoded_query = urllib.parse.quote_plus(query)
+            url = f"https://duckduckgo.com/html/?q={encoded_query}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Willy/1.0"})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                raw_html = resp.read().decode("utf-8", errors="replace")
+
+            results: list[tuple[str, str]] = []
+            marker = 'class="result__a"'
+            pos = 0
+            while len(results) < max_results:
+                idx = raw_html.find(marker, pos)
+                if idx == -1:
+                    break
+                href_attr = raw_html.rfind("href=", pos, idx)
+                if href_attr == -1:
+                    pos = idx + len(marker)
+                    continue
+
+                quote_char = raw_html[href_attr + 5:href_attr + 6]
+                if quote_char not in {'"', "'"}:
+                    pos = idx + len(marker)
+                    continue
+
+                href_start = href_attr + 6
+                href_end = raw_html.find(quote_char, href_start)
+                if href_end == -1:
+                    pos = idx + len(marker)
+                    continue
+
+                href = raw_html[href_start:href_end]
+                text_start = raw_html.find(">", idx)
+                text_end = raw_html.find("</a>", text_start + 1)
+                if text_start == -1 or text_end == -1:
+                    pos = idx + len(marker)
+                    continue
+
+                title = html.unescape(raw_html[text_start + 1:text_end].strip())
+                clean_url = self._decode_duckduckgo_redirect(href)
+                if title and clean_url:
+                    results.append((title, clean_url))
+
+                pos = text_end + 4
+
+            if not results:
+                return f"No web results found for: {query}"
+
+            lines = [f"Web results for: {query}"]
+            for i, (title, link) in enumerate(results, start=1):
+                lines.append(f"{i}. {title}\n   URL: {link}")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Error searching web: {exc}"
+
+    def _tool_fetch_webpage(self, args: dict) -> str:
+        raw_url = args.get("url", "").strip()
+        if not raw_url:
+            return "Error: url is required."
+
+        normalized_url = self._normalize_url(raw_url)
+        requested = args.get("max_chars", 12000)
+        try:
+            max_chars = int(requested)
+        except (TypeError, ValueError):
+            max_chars = 12000
+        max_chars = max(1000, min(max_chars, 40000))
+
+        # First attempt: use jina AI reader endpoint for cleaner extraction.
+        reader_url = "https://r.jina.ai/http://" + normalized_url.split("://", maxsplit=1)[1]
+        try:
+            req = urllib.request.Request(reader_url, headers={"User-Agent": "Willy/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                content = resp.read().decode("utf-8", errors="replace")
+            content = content.strip()
+            if content:
+                return self._limit_web_output(normalized_url, content, max_chars)
+        except Exception:
+            pass
+
+        # Fallback: fetch raw HTML and extract visible text.
+        try:
+            req = urllib.request.Request(normalized_url, headers={"User-Agent": "Willy/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html_content = resp.read().decode("utf-8", errors="replace")
+            text = self._html_to_text(html_content)
+            if not text:
+                return f"No readable text found at: {normalized_url}"
+            return self._limit_web_output(normalized_url, text, max_chars)
+        except Exception as exc:
+            return f"Error fetching webpage: {exc}"
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -466,6 +792,149 @@ class AIAgent:
         if os.path.isabs(path):
             return path
         return os.path.normpath(os.path.join(self.tm.get_cwd(), path))
+
+    def _normalize_url(self, raw_url: str) -> str:
+        if raw_url.startswith(("http://", "https://")):
+            return raw_url
+        return f"https://{raw_url}"
+
+    def _decode_duckduckgo_redirect(self, link: str) -> str:
+        if not link:
+            return ""
+        parsed = urllib.parse.urlparse(link)
+        if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+            params = urllib.parse.parse_qs(parsed.query)
+            candidate = params.get("uddg", [""])[0]
+            return urllib.parse.unquote(candidate) if candidate else ""
+        return link
+
+    def _html_to_text(self, html_content: str) -> str:
+        parser = _TextExtractor()
+        parser.feed(html_content)
+        text = parser.text()
+        return "\n".join(line for line in text.splitlines() if line.strip())
+
+    def _limit_web_output(self, source_url: str, content: str, max_chars: int) -> str:
+        if len(content) > max_chars:
+            clipped = content[:max_chars]
+            suffix = f"\n\n[...web content truncated at {max_chars} chars...]"
+        else:
+            clipped = content
+            suffix = ""
+        return f"Source URL: {source_url}\n\n{clipped}{suffix}"
+
+
+    def _tool_detect_microcontroller(self, args: dict) -> str:
+        """Detect connected microcontroller boards."""
+        if not self.arduino_manager:
+            return "Error: Arduino support not available (ArduinoManager not initialized)."
+        
+        try:
+            devices = self.arduino_manager.detect_microcontrollers()
+            if not devices:
+                return "No microcontroller boards detected. Check USB connections."
+            
+            lines = ["Detected microcontroller boards:"]
+            for i, device in enumerate(devices, 1):
+                port = device.get("port", "?")
+                board = device.get("board", "unknown")
+                desc = device.get("description", "")
+                lines.append(f"{i}. {board.upper()} on {port} - {desc}")
+            
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Error detecting microcontrollers: {exc}"
+    
+    def _tool_build_microcontroller(self, args: dict) -> str:
+        """Build/compile a PlatformIO project."""
+        if not self.arduino_manager:
+            return "Error: Arduino support not available."
+        
+        project_path = args.get("project_path", "").strip()
+        if not project_path:
+            return "Error: project_path is required."
+        
+        env = args.get("env")
+        
+        try:
+            result = self.arduino_manager.build_sketch(project_path, env)
+            if result["ok"]:
+                return f"✓ Build successful\n\n{result['output']}"
+            else:
+                return f"✗ Build failed: {result['error']}\n\n{result['output']}"
+        except Exception as exc:
+            return f"Error building microcontroller project: {exc}"
+    
+    def _tool_upload_microcontroller(self, args: dict) -> str:
+        """Build and upload firmware to microcontroller."""
+        if not self.arduino_manager:
+            return "Error: Arduino support not available."
+        
+        project_path = args.get("project_path", "").strip()
+        port = args.get("port", self.config.get("default_port", "/dev/ttyUSB0"))
+        env = args.get("env", self.config.get("default_board", "esp32"))
+        
+        if not project_path:
+            return "Error: project_path is required."
+        
+        # Ask for confirmation
+        confirmed_event = threading.Event()
+        decision: list[bool] = []
+        
+        def on_decision(confirmed: bool) -> None:
+            decision.append(confirmed)
+            confirmed_event.set()
+        
+        self.on_confirm(
+            "Upload firmware?",
+            f"Project: {project_path}\nPort: {port}\nEnvironment: {env}",
+            on_decision,
+        )
+        confirmed_event.wait(timeout=120)
+        if not decision or not decision[0]:
+            return "Upload cancelled by user."
+        
+        try:
+            result = self.arduino_manager.upload_firmware(project_path, port, env)
+            if result["ok"]:
+                return f"✓ Firmware uploaded successfully\n\n{result['output']}"
+            else:
+                return f"✗ Upload failed: {result['error']}\n\n{result['output']}"
+        except Exception as exc:
+            return f"Error uploading firmware: {exc}"
+
+    def _tool_generate_iot_schematic(self, args: dict) -> str:
+        title = (args.get("title") or "IoT Diagram").strip()
+        board = (args.get("board") or "esp32").strip()
+        components = args.get("components") or []
+        connections = args.get("connections") or []
+
+        if not isinstance(components, list) or not components:
+            return "Error: components must be a non-empty array."
+        if not isinstance(connections, list):
+            return "Error: connections must be an array."
+
+        result = self.diagram_manager.generate_schematic(
+            title=title,
+            board=board,
+            components=components,
+            connections=connections,
+        )
+
+        if not result.ok:
+            return f"Error generating diagram: {result.message}"
+
+        lines = [
+            f"Schematic generated successfully for '{title}'.",
+            f"Board: {board}",
+            f"Components: {len(components)}",
+            f"Connections: {len(connections)}",
+            f"PNG: {result.png_path}",
+            f"SVG: {result.svg_path}",
+            f"BOM: {result.bom_path}",
+            f"NETLIST: {result.netlist_path}",
+        ]
+        return "\n".join(lines)
 
     def _log_event(self, event_type: str, payload: dict) -> None:
         """Best-effort local logging for debugging tool-call failures."""
