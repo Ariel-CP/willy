@@ -6,6 +6,7 @@ import html
 import json
 import os
 import threading
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -248,6 +249,40 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "flash_sketch_file",
+            "description": "End-to-end flow: prepare PlatformIO project from an .ino file, compile, and upload to detected microcontroller.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sketch_path": {
+                        "type": "string",
+                        "description": "Path to .ino sketch file.",
+                    },
+                    "project_path": {
+                        "type": "string",
+                        "description": "Optional PlatformIO project path. If omitted, sketch folder is used.",
+                    },
+                    "port": {
+                        "type": "string",
+                        "description": "Optional serial port (e.g., /dev/ttyUSB0). If omitted, auto-detect first board.",
+                    },
+                    "board": {
+                        "type": "string",
+                        "description": "PlatformIO board ID for new projects (default: uno).",
+                        "default": "uno",
+                    },
+                    "env": {
+                        "type": "string",
+                        "description": "Optional PlatformIO environment to build/upload.",
+                    },
+                },
+                "required": ["sketch_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_iot_schematic",
             "description": "Generate an IoT electronic schematic diagram (PNG/SVG) and BOM from components and connections.",
             "parameters": {
@@ -311,6 +346,7 @@ You have access to the following tools:
 - detect_microcontroller: detect connected Arduino, ESP32, or other microcontroller boards
 - build_microcontroller: compile Arduino/ESP32 projects using PlatformIO
 - upload_microcontroller: build and upload firmware to a connected microcontroller
+- flash_sketch_file: full automatic flow from .ino to upload (prepare project + build + upload)
 - generate_iot_schematic: create an electronic schematic diagram (PNG/SVG) and BOM
 
 Guidelines:
@@ -323,6 +359,38 @@ Guidelines:
 - When using web data, include source URLs in your final answer.
 - Be concise and helpful. Respond in the same language the user uses.
 - If a tool or command fails, analyze the error output and suggest a fix.
+
+**PLAN MODE (for multi-step operations):**
+When the user asks you to perform multiple steps (e.g., "create a Python project", "set up a server", "configure something"), you MUST:
+1. First, create a structured PLAN in XML format with all steps BEFORE executing any commands
+2. Present the plan to the user (do NOT execute commands yet)
+3. Wait for user confirmation (the UI will ask for it)
+4. ONLY after confirmation, execute all commands WITHOUT asking for more confirmations
+5. Do not ask for confirmation in plain text chat; rely on the UI confirmation dialog.
+
+Plan format:
+<plan>
+<step number="1">Description of what this step does</step>
+<step number="2">Description of what this step does</step>
+<step number="N">Description of what this step does</step>
+</plan>
+
+Example workflow:
+User: "Create a Python project with requirements.txt"
+You respond: "I'll create a Python project for you. Here's my plan:
+<plan>
+<step number="1">Create project directory</step>
+<step number="2">Create requirements.txt with initial dependencies</step>
+<step number="3">Create virtual environment</step>
+</plan>
+Should I proceed with this plan?"
+
+After user confirms: Execute all steps WITHOUT asking again.
+
+Limits for safety:
+- Maximum 15 steps per plan (prevents infinite loops)
+- If a step fails, pause and explain the error to the user before continuing
+- Always summarize what was executed after completion
 """
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "willy_tool_errors.log")
@@ -362,7 +430,10 @@ class AIAgent:
         on_message: Callable[[str, str], None],
         on_confirm_request: Callable[[str, str, Callable], None],
         on_status: Callable[[str], None],
+        on_progress: Optional[Callable[[float, str], None]] = None,
         arduino_manager=None,
+        on_file_written: Optional[Callable[[str, str], None]] = None,
+        on_schematic_generated: Optional[Callable[[str, str], None]] = None,
     ):
         """
         Parameters
@@ -379,10 +450,38 @@ class AIAgent:
         self.on_message = on_message
         self.on_confirm = on_confirm_request
         self.on_status = on_status
+        self.on_progress = on_progress
         self.arduino_manager = arduino_manager
+        self.on_file_written = on_file_written
+        self.on_schematic_generated = on_schematic_generated
         self.diagram_manager = IoTDiagramManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
         self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         self._client: Optional[openai.OpenAI] = None
+        
+        # Plan mode state
+        self.plan_steps: list[str] = []
+        self.awaiting_plan_confirmation = False
+        self.queued_commands: list[dict] = []
+        self.skip_confirmations_until = None  # Unix timestamp or None
+        self._progress_value = 0.0
+
+    def _emit_progress(self, percent: float, detail: str = "") -> None:
+        """Send monotonic progress updates to the UI (0-100)."""
+        try:
+            value = max(0.0, min(100.0, float(percent)))
+        except Exception:
+            value = 0.0
+
+        # Avoid visual jitter going backwards across internal loop iterations.
+        if value < self._progress_value:
+            value = self._progress_value
+
+        self._progress_value = value
+        if callable(self.on_progress):
+            try:
+                self.on_progress(value, detail)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Public
@@ -424,15 +523,93 @@ class AIAgent:
             self._client = openai.OpenAI(api_key=api_key)
         return self._client
 
+    def _extract_plan_steps(self, text: str) -> list[str]:
+        """Extract plan steps from XML tags in assistant response."""
+        import re
+        steps = []
+        pattern = r'<step\s+number="(\d+)">(.+?)</step>'
+        matches = re.findall(pattern, text, re.DOTALL)
+        for num, content in matches:
+            steps.append(content.strip())
+
+        if steps:
+            return steps
+
+        # Fallback for plain-text numbered plans.
+        for line in text.splitlines():
+            stripped = line.strip()
+            m = re.match(r"^(\d+)\.\s+(.+)$", stripped)
+            if m:
+                steps.append(m.group(2).strip())
+        return steps
+
+    def _has_plan(self, text: str) -> bool:
+        """Check if text contains a <plan> tag."""
+        return "<plan>" in text and "</plan>" in text
+
+    def _looks_like_textual_plan(self, text: str) -> bool:
+        """Heuristic for plan-style responses without XML tags."""
+        if not text:
+            return False
+
+        lowered = text.lower()
+        has_plan_word = "plan" in lowered
+        has_numbered_steps = any(f"{i}." in lowered for i in range(1, 7))
+        asks_confirmation = (
+            "confirma" in lowered
+            or "confirm" in lowered
+            or "deseas que contin" in lowered
+            or "should i proceed" in lowered
+        )
+        return has_plan_word and has_numbered_steps and asks_confirmation
+
+    def _format_plan_display(self, steps: list[str]) -> str:
+        """Format plan steps for display."""
+        if not steps:
+            return ""
+        lines = ["📋 **Plan:**"]
+        for i, step in enumerate(steps, 1):
+            lines.append(f"{i}. {step}")
+        return "\n".join(lines)
+
+    def _request_plan_confirmation(self, steps: list[str]) -> bool:
+        """Request user confirmation for plan execution. Returns True if confirmed."""
+        confirmed = False
+        event = threading.Event()
+
+        self._emit_progress(30, "Esperando confirmacion del plan")
+
+        def on_user_decision(user_confirmed: bool) -> None:
+            nonlocal confirmed
+            confirmed = user_confirmed
+            event.set()
+
+        plan_display = self._format_plan_display(steps)
+        self.on_confirm(
+            "Confirmar plan de ejecución",
+            plan_display + "\n\n¿Ejecutar estos pasos?",
+            on_user_decision,
+        )
+        event.wait(timeout=120)
+        
+        # If confirmed, skip command confirmations for the next 5 minutes
+        if confirmed:
+            self.skip_confirmations_until = time.time() + 300
+        
+        return confirmed
+
     def _process(self, user_text: str) -> None:
         self.history.append({"role": "user", "content": user_text})
         self.on_status(i18n.get("ai_thinking"))
+        self._progress_value = 0.0
+        self._emit_progress(5, "Analizando solicitud")
         try:
             client = self._get_client()
             model = self.config.get("model", "gpt-4o")
             recovered_bad_history = False
             # Agentic loop: keep going until no more tool calls
             while True:
+                self._emit_progress(12, "Consultando modelo")
                 try:
                     response = client.chat.completions.create(
                         model=model,
@@ -466,9 +643,52 @@ class AIAgent:
                 msg = response.choices[0].message
                 self.history.append(msg.to_dict())
 
+                # Check for plan in assistant's response
+                assistant_text = msg.content or ""
+                is_plan_text = False
+                plan_cancelled = False
+                if assistant_text:
+                    is_plan_text = self._has_plan(assistant_text) or self._looks_like_textual_plan(assistant_text)
+
+                if assistant_text and is_plan_text:
+                    self._emit_progress(25, "Plan detectado")
+                    # Show the plan message first
+                    self.on_message("assistant", assistant_text)
+                    
+                    # Extract plan steps
+                    plan_steps = self._extract_plan_steps(assistant_text)
+                    if plan_steps:
+                        self.plan_steps = plan_steps
+                        
+                        # Request confirmation for the plan
+                        if self._request_plan_confirmation(plan_steps):
+                            self._emit_progress(35, "Plan confirmado")
+                            # User confirmed — set flag to skip confirmations for next commands
+                            self.awaiting_plan_confirmation = False
+                            # Force immediate execution on next loop (avoid re-planning loop).
+                            self.history.append({
+                                "role": "user",
+                                "content": "Plan confirmed in UI. Execute now directly with tools and do not ask for confirmation in chat.",
+                            })
+                        else:
+                            # User cancelled — break the loop
+                            self.on_message("system", "Plan cancelled by user.")
+                            plan_cancelled = True
+
+                    # If this response only contained plan text, request another turn.
+                    # If it also contains tool_calls, do NOT skip tool processing.
+                    if not msg.tool_calls:
+                        continue
+
+                if plan_cancelled:
+                    break
+
                 if msg.tool_calls:
                     # Process each tool call
-                    for tc in msg.tool_calls:
+                    total_calls = max(1, len(msg.tool_calls))
+                    for idx, tc in enumerate(msg.tool_calls, start=1):
+                        step_pct = 35 + (idx / total_calls) * 55
+                        self._emit_progress(step_pct, f"Ejecutando: {tc.function.name}")
                         try:
                             result = self._dispatch_tool(tc)
                         except Exception as exc:  # noqa: BLE001
@@ -484,22 +704,27 @@ class AIAgent:
                             "content": result,
                         })
                     # Continue the loop so the model can process tool results
+                    self._emit_progress(92, "Procesando resultados")
                     continue
 
                 # No tool calls — final text response
-                assistant_text = msg.content or ""
-                if assistant_text:
+                if assistant_text and not is_plan_text:
                     self.on_message("assistant", assistant_text)
+                self._emit_progress(100, "Completado")
                 break
 
         except ValueError as exc:
             self.on_message("error", str(exc))
+            self._emit_progress(100, "Completado con error")
         except openai.AuthenticationError:
             self.on_message("error", "Invalid API key. Please check config.json.")
+            self._emit_progress(100, "Completado con error")
         except openai.RateLimitError:
             self.on_message("error", "Rate limit reached. Please wait a moment.")
+            self._emit_progress(100, "Completado con error")
         except Exception as exc:  # noqa: BLE001
             self.on_message("error", f"Unexpected error: {exc}")
+            self._emit_progress(100, "Completado con error")
         finally:
             self.on_status("")
 
@@ -526,6 +751,7 @@ class AIAgent:
             "detect_microcontroller": self._tool_detect_microcontroller,
             "build_microcontroller": self._tool_build_microcontroller,
             "upload_microcontroller": self._tool_upload_microcontroller,
+            "flash_sketch_file": self._tool_flash_sketch_file,
             "generate_iot_schematic": self._tool_generate_iot_schematic,
         }
         handler = dispatch.get(name)
@@ -538,6 +764,12 @@ class AIAgent:
     # ------------------------------------------------------------------
 
     def _needs_confirmation(self, command: str) -> bool:
+        import time
+        
+        # Skip confirmation if plan was just confirmed (within 5 minute window)
+        if self.skip_confirmations_until is not None and time.time() < self.skip_confirmations_until:
+            return False
+        
         if self.config.get("confirm_readonly", False):
             return True
         always = self.config.get("always_confirm", [])
@@ -636,6 +868,13 @@ class AIAgent:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(content)
+
+            if callable(self.on_file_written):
+                try:
+                    self.on_file_written(path, content)
+                except Exception:
+                    pass
+
             return f"File written successfully: {path}"
         except PermissionError:
             return f"Error: permission denied writing to {path}"
@@ -823,6 +1062,118 @@ class AIAgent:
             suffix = ""
         return f"Source URL: {source_url}\n\n{clipped}{suffix}"
 
+    def _board_env_candidates(self, board_hint: str) -> list[str]:
+        """Return likely PlatformIO env names for a detected board hint."""
+        if not board_hint:
+            return []
+
+        b = board_hint.strip().lower()
+        if b in {"arduino_uno", "arduino:avr:uno", "uno"}:
+            return ["uno", "arduino_uno", "arduino-avr-uno"]
+        if b in {"arduino_compatible", "arduino", "arduino:avr:nano", "nano"}:
+            return ["uno", "nano", "arduino"]
+        if "esp32-s3" in b:
+            return ["esp32-s3", "esp32s3", "s3"]
+        if "esp32" in b:
+            return ["esp32", "esp32dev"]
+        if "pico" in b:
+            return ["pico", "rp2040"]
+        return [b]
+
+    def _resolve_project_env(
+        self,
+        project_path: str,
+        requested_env: Optional[str] = None,
+        port: Optional[str] = None,
+    ) -> tuple[Optional[str], str]:
+        """
+        Pick the best PlatformIO env for this project.
+
+        Priority:
+        1) explicit env requested by tool call
+        2) env inferred from detected board on selected port
+        3) env inferred from configured default board
+        4) project's default_env / first env
+        """
+        if not self.arduino_manager:
+            return requested_env, ""
+
+        info = self.arduino_manager.get_project_info(project_path)
+        if not info.get("ok"):
+            # If we cannot inspect project metadata, keep requested value as-is.
+            return requested_env, ""
+
+        envs = [str(e).strip() for e in info.get("environments", []) if str(e).strip()]
+        envs_l = [e.lower() for e in envs]
+        if not envs:
+            return requested_env, ""
+
+        # 1) Explicit env
+        if requested_env:
+            req = requested_env.strip()
+            if req.lower() in envs_l:
+                chosen = envs[envs_l.index(req.lower())]
+                return chosen, f"Using requested env: {chosen}"
+
+        candidates: list[str] = []
+        if requested_env:
+            candidates.append(requested_env.strip().lower())
+
+        # 2) Detect board from selected port, then infer likely env names.
+        detected_board = ""
+        try:
+            devices = self.arduino_manager.detect_microcontrollers()
+            selected = None
+            if port:
+                selected = next((d for d in devices if d.get("port") == port), None)
+            if selected is None and devices:
+                selected = devices[0]
+            if selected:
+                detected_board = str(selected.get("board", "")).strip().lower()
+                candidates.extend(self._board_env_candidates(detected_board))
+        except Exception:
+            pass
+
+        # 3) Configured default board hint.
+        default_board = str(self.config.get("default_board", "")).strip().lower()
+        candidates.extend(self._board_env_candidates(default_board))
+
+        # De-duplicate while preserving order.
+        seen = set()
+        uniq_candidates: list[str] = []
+        for cand in candidates:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            uniq_candidates.append(cand)
+
+        # Exact match first.
+        for cand in uniq_candidates:
+            if cand in envs_l:
+                chosen = envs[envs_l.index(cand)]
+                note = f"Auto-selected env '{chosen}'"
+                if detected_board:
+                    note += f" from detected board '{detected_board}'"
+                return chosen, note
+
+        # Fuzzy match by containment.
+        for cand in uniq_candidates:
+            for idx, env_name in enumerate(envs_l):
+                if cand in env_name or env_name in cand:
+                    chosen = envs[idx]
+                    note = f"Auto-selected env '{chosen}' via heuristic"
+                    if detected_board:
+                        note += f" (board '{detected_board}')"
+                    return chosen, note
+
+        # 4) Fallback to project default or first env.
+        default_env = info.get("default_env")
+        if default_env and str(default_env).strip().lower() in envs_l:
+            chosen = envs[envs_l.index(str(default_env).strip().lower())]
+            return chosen, f"Using project default env: {chosen}"
+
+        return envs[0], f"Using first project env: {envs[0]}"
+
 
     def _tool_detect_microcontroller(self, args: dict) -> str:
         """Detect connected microcontroller boards."""
@@ -854,13 +1205,18 @@ class AIAgent:
         if not project_path:
             return "Error: project_path is required."
         
-        env = args.get("env")
+        env_arg = args.get("env")
+        env, env_note = self._resolve_project_env(project_path, requested_env=env_arg)
         
         try:
             result = self.arduino_manager.build_sketch(project_path, env)
             if result["ok"]:
+                if env_note:
+                    return f"✓ Build successful\n{env_note}\n\n{result['output']}"
                 return f"✓ Build successful\n\n{result['output']}"
             else:
+                if env_note:
+                    return f"✗ Build failed: {result['error']}\n{env_note}\n\n{result['output']}"
                 return f"✗ Build failed: {result['error']}\n\n{result['output']}"
         except Exception as exc:
             return f"Error building microcontroller project: {exc}"
@@ -871,12 +1227,29 @@ class AIAgent:
             return "Error: Arduino support not available."
         
         project_path = args.get("project_path", "").strip()
-        port = args.get("port", self.config.get("default_port", "/dev/ttyUSB0"))
-        env = args.get("env", self.config.get("default_board", "esp32"))
+        port = (args.get("port") or "").strip()
+        env_arg = args.get("env")
         
         if not project_path:
             return "Error: project_path is required."
+
+        if not port:
+            try:
+                devices = self.arduino_manager.detect_microcontrollers()
+                if devices:
+                    port = str(devices[0].get("port", "")).strip()
+            except Exception:
+                port = ""
+
+        if not port:
+            port = self.config.get("default_port", "/dev/ttyUSB0")
         
+        env, env_note = self._resolve_project_env(
+            project_path,
+            requested_env=env_arg,
+            port=port,
+        )
+
         # Ask for confirmation
         confirmed_event = threading.Event()
         decision: list[bool] = []
@@ -887,7 +1260,8 @@ class AIAgent:
         
         self.on_confirm(
             "Upload firmware?",
-            f"Project: {project_path}\nPort: {port}\nEnvironment: {env}",
+            f"Project: {project_path}\nPort: {port}\nEnvironment: {env or '(auto)'}"
+            + (f"\n{env_note}" if env_note else ""),
             on_decision,
         )
         confirmed_event.wait(timeout=120)
@@ -902,6 +1276,86 @@ class AIAgent:
                 return f"✗ Upload failed: {result['error']}\n\n{result['output']}"
         except Exception as exc:
             return f"Error uploading firmware: {exc}"
+
+    def _tool_flash_sketch_file(self, args: dict) -> str:
+        """Prepare project from .ino, then compile and upload in one flow."""
+        if not self.arduino_manager:
+            return "Error: Arduino support not available."
+
+        sketch_raw = args.get("sketch_path", "").strip()
+        if not sketch_raw:
+            return "Error: sketch_path is required."
+
+        project_raw = args.get("project_path", "").strip()
+        board = (args.get("board") or "uno").strip() or "uno"
+        env_arg = args.get("env")
+        port = (args.get("port") or "").strip()
+
+        sketch_path = self._resolve_path(sketch_raw)
+        project_path = self._resolve_path(project_raw) if project_raw else ""
+
+        if not port:
+            try:
+                devices = self.arduino_manager.detect_microcontrollers()
+                if devices:
+                    port = str(devices[0].get("port", "")).strip()
+            except Exception:
+                port = ""
+        if not port:
+            port = self.config.get("default_port", "/dev/ttyUSB0")
+
+        confirm_lines = [
+            f"Sketch: {sketch_path}",
+            f"Project: {project_path or '(same folder as sketch)'}",
+            f"Board: {board}",
+            f"Port: {port}",
+            f"Env: {env_arg or '(auto)'}",
+        ]
+
+        confirmed_event = threading.Event()
+        decision: list[bool] = []
+
+        def on_decision(confirmed: bool) -> None:
+            decision.append(confirmed)
+            confirmed_event.set()
+
+        self.on_confirm(
+            "Compilar y cargar sketch?",
+            "\n".join(confirm_lines),
+            on_decision,
+        )
+        confirmed_event.wait(timeout=120)
+        if not decision or not decision[0]:
+            return "Flash cancelled by user."
+
+        prep = self.arduino_manager.prepare_project_from_ino(
+            sketch_path=sketch_path,
+            project_path=project_path or None,
+            board=board,
+        )
+        if not prep.get("ok"):
+            return f"✗ Preparation failed: {prep.get('error', 'unknown error')}\n\n{prep.get('output', '')}"
+
+        proj = prep.get("project_path", project_path)
+        env, env_note = self._resolve_project_env(proj, requested_env=env_arg, port=port)
+        result = self.arduino_manager.upload_firmware(proj, port, env)
+        if not result.get("ok"):
+            return (
+                f"✗ Upload failed: {result.get('error', 'unknown error')}\n"
+                + (f"{env_note}\n" if env_note else "")
+                + f"\nPreparation:\n{prep.get('output', '')}\n\nBuild/Upload Output:\n{result.get('output', '')}"
+            )
+
+        lines = ["✓ Sketch compiled and uploaded successfully"]
+        if env_note:
+            lines.append(env_note)
+        lines.append("")
+        lines.append("Preparation:")
+        lines.append(prep.get("output", ""))
+        lines.append("")
+        lines.append("Build/Upload Output:")
+        lines.append(result.get("output", ""))
+        return "\n".join(lines)
 
     def _tool_generate_iot_schematic(self, args: dict) -> str:
         title = (args.get("title") or "IoT Diagram").strip()
@@ -923,6 +1377,12 @@ class AIAgent:
 
         if not result.ok:
             return f"Error generating diagram: {result.message}"
+
+        if callable(self.on_schematic_generated):
+            try:
+                self.on_schematic_generated(result.svg_path, result.bom_path)
+            except Exception:
+                pass
 
         lines = [
             f"Schematic generated successfully for '{title}'.",

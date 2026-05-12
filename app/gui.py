@@ -9,7 +9,9 @@ import platform
 import socket
 import queue
 import threading
+import traceback
 import webbrowser
+from datetime import datetime
 import tkinter as tk
 import customtkinter as ctk
 from PIL import Image, ImageTk
@@ -68,6 +70,7 @@ class WillyApp(ctk.CTk):
         self.title(i18n.get("app_title"))
         self.geometry("1280x760")
         self.minsize(900, 600)
+        self._app_session_start_ts = datetime.now().timestamp()
 
         self._device_scan_running = False
         self._device_poll_job = None
@@ -77,6 +80,14 @@ class WillyApp(ctk.CTk):
         self._latest_bom_path = ""
         self._schematic_preview_image = None
         self._schematic_preview_photo = None
+        self.serial_window = None
+        self.serial_output_text = None
+        self.serial_terminal_manager = None
+        self.serial_status_var = tk.StringVar(value="Monitor serial inactivo")
+        self.serial_timestamps_var = tk.BooleanVar(value=True)
+        self.serial_freeze_var = tk.BooleanVar(value=False)
+        self.serial_paused_buffer: list[str] = []
+        self.serial_paused_buffer_max = 5000
 
         self._build_layout()
         self._wire_up()
@@ -100,6 +111,11 @@ class WillyApp(ctk.CTk):
 
         initial_dir = self.config_data.get("initial_directory", "~")
         self.session_logger = SessionLogger()
+        self.session_logger.log_event(
+            "app_start",
+            component="gui",
+            data={"cwd": os.getcwd(), "config_path": CONFIG_PATH},
+        )
         self.terminal_manager = TerminalManager(
             output_callback=self._on_terminal_output,
             initial_dir=initial_dir,
@@ -110,7 +126,12 @@ class WillyApp(ctk.CTk):
         self.arduino_manager = ArduinoManager(
             config=self.config_data,
             on_status=self._on_status,
+            on_error=lambda msg: self._on_system_error(msg, component="arduino"),
         )
+
+        # Catch UI and background-thread exceptions into diagnostics logs.
+        self.report_callback_exception = self._handle_tk_exception
+        threading.excepthook = self._handle_thread_exception
 
         self.file_browser = FileBrowser(
             self,
@@ -160,6 +181,30 @@ class WillyApp(ctk.CTk):
         )
         self.status_bar_label.grid(row=0, column=0, sticky="ew", padx=4)
 
+        self.progress_bar = ctk.CTkProgressBar(
+            status_bar,
+            width=180,
+            height=10,
+            corner_radius=6,
+            progress_color="#64748b",
+        )
+        self.progress_bar.set(0)
+        self.progress_bar.grid(row=0, column=1, padx=(0, 6), pady=4)
+
+        self.progress_percent_label = ctk.CTkLabel(
+            status_bar,
+            text="0%",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=("gray35", "gray70"),
+            width=42,
+            anchor="e",
+        )
+        self.progress_percent_label.grid(row=0, column=2, padx=(0, 8), pady=2, sticky="e")
+        self._progress_state = "idle"
+        self._progress_current = 0.0
+        self._progress_target = 0.0
+        self._progress_animation_job = None
+
         ctk.CTkButton(
             status_bar,
             text=i18n.get("settings_btn"),
@@ -169,13 +214,13 @@ class WillyApp(ctk.CTk):
             fg_color="transparent",
             hover_color=("gray70", "gray30"),
             command=self._open_settings,
-        ).grid(row=0, column=1, padx=(0, 4))
+        ).grid(row=0, column=3, padx=(0, 4))
 
     def _build_iot_dashboard(self, parent) -> None:
         dashboard = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
         dashboard.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         dashboard.grid_columnconfigure(0, weight=1)
-        dashboard.grid_rowconfigure(7, weight=1)
+        dashboard.grid_rowconfigure(8, weight=1)
 
         top_row = ctk.CTkFrame(dashboard, fg_color="transparent")
         top_row.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 4))
@@ -259,8 +304,82 @@ class WillyApp(ctk.CTk):
         )
         self.connect_btn.grid(row=0, column=1, sticky="e")
 
+        monitor_row = ctk.CTkFrame(dashboard, fg_color="transparent")
+        monitor_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 4))
+        monitor_row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            monitor_row,
+            text="Monitor serial",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=("gray35", "gray75"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 6))
+
+        self.serial_baud_var = tk.StringVar(value=str(self.config_data.get("serial_baud", 115200)))
+        self.serial_baud_entry = ctk.CTkEntry(
+            monitor_row,
+            width=86,
+            textvariable=self.serial_baud_var,
+            placeholder_text="115200",
+        )
+        self.serial_baud_entry.grid(row=0, column=1, sticky="w", padx=(0, 6))
+
+        self.serial_start_btn = ctk.CTkButton(
+            monitor_row,
+            text="Iniciar",
+            width=72,
+            height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            command=self._start_serial_monitor,
+        )
+        self.serial_start_btn.grid(row=0, column=2, sticky="e", padx=(0, 4))
+
+        self.serial_open_btn = ctk.CTkButton(
+            monitor_row,
+            text="Abrir",
+            width=62,
+            height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=self._open_serial_monitor_window,
+        )
+        self.serial_open_btn.grid(row=0, column=3, sticky="e", padx=(0, 4))
+
+        self.serial_stop_btn = ctk.CTkButton(
+            monitor_row,
+            text="Detener",
+            width=72,
+            height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="#c0392b",
+            hover_color="#922b21",
+            command=self._stop_serial_monitor,
+        )
+        self.serial_stop_btn.grid(row=0, column=4, sticky="e")
+
+        self.serial_hint_label = ctk.CTkLabel(
+            monitor_row,
+            text="Salida en ventana dedicada del monitor serial",
+            font=ctk.CTkFont(size=9),
+            text_color=("gray45", "gray65"),
+            anchor="w",
+        )
+        self.serial_hint_label.grid(row=1, column=0, columnspan=5, sticky="w", pady=(2, 0))
+
+        self.serial_state_label = ctk.CTkLabel(
+            monitor_row,
+            textvariable=self.serial_status_var,
+            font=ctk.CTkFont(size=9),
+            text_color=("gray45", "#7ec8e3"),
+            anchor="w",
+        )
+        self.serial_state_label.grid(row=2, column=0, columnspan=5, sticky="w", pady=(1, 0))
+
         diagram_row = ctk.CTkFrame(dashboard, fg_color="transparent")
-        diagram_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 4))
+        diagram_row.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 4))
         diagram_row.grid_columnconfigure(0, weight=1)
 
         self.diagram_status_label = ctk.CTkLabel(
@@ -304,7 +423,7 @@ class WillyApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=("gray30", "gray80"),
             anchor="w",
-        ).grid(row=4, column=0, sticky="w", padx=8, pady=(4, 2))
+        ).grid(row=5, column=0, sticky="w", padx=8, pady=(4, 2))
 
         self.diagram_preview = tk.Label(
             dashboard,
@@ -315,7 +434,7 @@ class WillyApp(ctk.CTk):
             justify="center",
             height=6,
         )
-        self.diagram_preview.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 6))
+        self.diagram_preview.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 6))
 
         ctk.CTkLabel(
             dashboard,
@@ -323,7 +442,7 @@ class WillyApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=("gray30", "gray80"),
             anchor="w",
-        ).grid(row=6, column=0, sticky="w", padx=8, pady=(2, 2))
+        ).grid(row=7, column=0, sticky="w", padx=8, pady=(2, 2))
 
         self.code_preview = ctk.CTkTextbox(
             dashboard,
@@ -334,7 +453,7 @@ class WillyApp(ctk.CTk):
             border_width=1,
             wrap="word",
         )
-        self.code_preview.grid(row=7, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self.code_preview.grid(row=8, column=0, sticky="nsew", padx=8, pady=(0, 8))
         self.code_preview.insert("0.0", "Selecciona un archivo para ver el codigo en desarrollo...")
         self.code_preview.configure(state="disabled")
 
@@ -351,7 +470,10 @@ class WillyApp(ctk.CTk):
             on_message=self._on_ai_message,
             on_confirm_request=self._on_confirm_request,
             on_status=self._on_status,
+            on_progress=self._on_progress,
             arduino_manager=self.arduino_manager,
+            on_file_written=self._on_ai_file_written,
+            on_schematic_generated=self._on_schematic_generated,
         )
 
         def _logged_send(text: str) -> None:
@@ -422,6 +544,8 @@ class WillyApp(ctk.CTk):
     def _on_ai_message(self, role: str, text: str) -> None:
         self.chat_panel.add_message(role, text)
         self.session_logger.log_message(role, text)
+        if role == "error":
+            self.session_logger.log_error("ai_agent", text)
         # Reacciones suaves para un asistente amigable orientado a adultos mayores.
         if role == "assistant":
             if "Web results for:" in text or "Source URL:" in text:
@@ -445,11 +569,132 @@ class WillyApp(ctk.CTk):
         self.after(0, self.status_bar_label.configure, {
             "text": f"  {text}" if text else f"  {i18n.get('ready')}"
         })
+        lowered = (text or "").lower()
+        if any(token in lowered for token in ("error", "failed", "fallo", "exception")):
+            self.session_logger.log_event(
+                "status_warning",
+                level="warning",
+                component="status",
+                data={"text": text},
+            )
+
+    def _on_progress(self, percent: float, detail: str = "") -> None:
+        """Update bottom progress bar with completion percentage."""
+        try:
+            pct = max(0.0, min(100.0, float(percent)))
+        except Exception:
+            pct = 0.0
+
+        detail_l = (detail or "").lower()
+        if any(token in detail_l for token in ("error", "failed", "fallo", "exception")):
+            state = "error"
+        elif any(token in detail_l for token in ("confirm", "esperando", "plan detectado")):
+            state = "waiting"
+        elif pct >= 100.0:
+            state = "success"
+        elif pct > 0:
+            state = "running"
+        else:
+            state = "idle"
+
+        def _apply() -> None:
+            self._progress_target = pct
+            self._set_progress_theme(state)
+            self._ensure_progress_animation()
+
+            # Keep status and progress consistent for user confidence.
+            if detail:
+                self.status_bar_label.configure(text=f"  {detail} ({int(round(pct))}%)")
+
+        self.after(0, _apply)
+
+    def _ensure_progress_animation(self) -> None:
+        if self._progress_animation_job is not None:
+            return
+        self._progress_animation_job = self.after(16, self._animate_progress)
+
+    def _animate_progress(self) -> None:
+        self._progress_animation_job = None
+
+        current = float(self._progress_current)
+        target = float(self._progress_target)
+        delta = target - current
+
+        # Ease-out interpolation: smooth at long jumps, precise near target.
+        if abs(delta) < 0.2:
+            current = target
+        else:
+            current = current + (delta * 0.24)
+
+        self._progress_current = max(0.0, min(100.0, current))
+
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.set(self._progress_current / 100.0)
+        if hasattr(self, "progress_percent_label"):
+            self.progress_percent_label.configure(text=f"{int(round(self._progress_current))}%")
+
+        if abs(self._progress_target - self._progress_current) >= 0.2:
+            self._progress_animation_job = self.after(16, self._animate_progress)
+
+    def _set_progress_theme(self, state: str) -> None:
+        if state == self._progress_state:
+            return
+        self._progress_state = state
+
+        palette = {
+            "idle": ("#64748b", ("gray35", "gray70")),
+            "running": ("#2563eb", ("#1e3a8a", "#93c5fd")),
+            "waiting": ("#f59e0b", ("#92400e", "#fcd34d")),
+            "success": ("#22c55e", ("#166534", "#86efac")),
+            "error": ("#ef4444", ("#991b1b", "#fca5a5")),
+        }
+        progress_color, text_color = palette.get(state, palette["idle"])
+
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.configure(progress_color=progress_color)
+        if hasattr(self, "progress_percent_label"):
+            self.progress_percent_label.configure(text_color=text_color)
+
+    def _on_system_error(self, message: str, component: str = "system") -> None:
+        self.session_logger.log_error(component, message)
 
     def _on_file_selected(self, path: str) -> None:
         self.chat_panel.add_message("system", i18n.get("file_selected", path=path))
         self._update_code_preview(path)
         self.ai_agent.send(i18n.get("file_send_msg", path=path))
+
+    def _on_schematic_generated(self, svg_path: str, bom_path: str) -> None:
+        # Called from agent worker thread; marshal to UI thread.
+        self.after(0, self._apply_generated_schematic, svg_path, bom_path)
+
+    def _apply_generated_schematic(self, svg_path: str, bom_path: str) -> None:
+        self._latest_schematic_path = svg_path or ""
+        self._latest_bom_path = bom_path or ""
+
+        if hasattr(self, "diagram_status_label"):
+            if svg_path and os.path.isfile(svg_path):
+                self.diagram_status_label.configure(text=f"Diagrama: {os.path.basename(svg_path)}")
+                self.diagram_open_btn.configure(state="normal")
+            else:
+                self.diagram_status_label.configure(text="Diagrama: sin generar en esta sesión")
+                self.diagram_open_btn.configure(state="disabled")
+
+        self._update_schematic_preview(svg_path)
+
+    def _on_ai_file_written(self, path: str, content: str) -> None:
+        # Called from agent worker thread; marshal to UI thread.
+        self.after(0, self._update_code_preview_from_content, path, content)
+
+    def _update_code_preview_from_content(self, path: str, content: str) -> None:
+        preview = f"Archivo (editado por Willy): {path}\n\n{content}"
+        if len(preview) > 6500:
+            preview = preview[:6500] + "\n\n[...archivo truncado en 6500 caracteres...]"
+
+        if hasattr(self, "code_preview"):
+            self.code_preview.configure(state="normal")
+            self.code_preview.delete("0.0", "end")
+            self.code_preview.insert("0.0", preview)
+            self.code_preview.configure(state="disabled")
 
     def _set_device_indicator(self, connected: bool) -> None:
         if not hasattr(self, "device_indicator"):
@@ -485,6 +730,7 @@ class WillyApp(ctk.CTk):
             self.scan_btn.configure(state="normal")
 
         if error:
+            self._on_system_error(str(error), component="device_scan")
             self._detected_devices = []
             self._refresh_device_picker()
             self._set_device_indicator(False)
@@ -563,6 +809,241 @@ class WillyApp(ctk.CTk):
         self.device_detail_label.configure(text="Puerto y placa por defecto actualizados")
         self._on_status(f"IoT activo: {board} en {port}")
 
+    def _selected_or_default_port(self) -> str:
+        selected = self.device_picker_var.get() if hasattr(self, "device_picker_var") else ""
+        if selected and selected != "Sin dispositivos":
+            for dev in self._detected_devices:
+                label = f"{dev.get('board', 'unknown')} - {dev.get('port', '?')}"
+                if label == selected:
+                    return dev.get("port", self.config_data.get("default_port", "/dev/ttyUSB0"))
+        return self.config_data.get("default_port", "/dev/ttyUSB0")
+
+    def _start_serial_monitor(self) -> None:
+        self._open_serial_monitor_window()
+
+        port = self._selected_or_default_port()
+        baud_raw = self.serial_baud_var.get().strip() if hasattr(self, "serial_baud_var") else "115200"
+        try:
+            baud = int(baud_raw)
+            if baud <= 0:
+                raise ValueError("baud must be positive")
+        except Exception:
+            self.chat_panel.add_message("error", f"Baudrate inválido: {baud_raw}")
+            return
+
+        if self.serial_terminal_manager and self.serial_terminal_manager.has_active_process():
+            self.chat_panel.add_message("system", "El monitor serial ya está activo.")
+            return
+
+        self.config_data["serial_baud"] = baud
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+                json.dump(self.config_data, fh, indent=4)
+        except Exception:
+            pass
+
+        if self.serial_terminal_manager is None:
+            self.serial_terminal_manager = TerminalManager(
+                output_callback=self._on_serial_monitor_output,
+                initial_dir=self.terminal_manager.get_cwd(),
+            )
+
+        pio_cmd = self.arduino_manager.platformio_path if getattr(self.arduino_manager, "platformio_path", None) else "pio"
+        command = f"{pio_cmd} device monitor -p {port} -b {baud}"
+
+        self.serial_paused_buffer.clear()
+        self.serial_freeze_var.set(False)
+        self._serial_append_output(f"$ {command}\n")
+        self._serial_append_output("[Monitor serial iniciado - presiona 'Detener' para finalizar]\n")
+        self.serial_terminal_manager.run_command_async(command)
+        self.serial_status_var.set(f"Monitor activo en {port} @ {baud}")
+        self._on_status(f"Monitor serial activo en {port} @ {baud}")
+        self.session_logger.log_event(
+            "serial_monitor_started",
+            component="iot",
+            data={"port": port, "baud": baud},
+        )
+
+    def _stop_serial_monitor(self) -> None:
+        if self.serial_terminal_manager and self.serial_terminal_manager.has_active_process():
+            self.serial_terminal_manager.kill_active()
+            self._serial_append_output("[Monitor serial detenido]\n")
+            self.serial_status_var.set("Monitor serial detenido")
+            self._on_status("Monitor serial detenido")
+            self.session_logger.log_event("serial_monitor_stopped", component="iot")
+        else:
+            self.chat_panel.add_message("system", "No hay monitor serial activo.")
+
+    def _open_serial_monitor_window(self) -> None:
+        if self.serial_window is not None and self.serial_window.winfo_exists():
+            self.serial_window.lift()
+            self.serial_window.focus_force()
+            return
+
+        win = ctk.CTkToplevel(self)
+        win.title("Consola Serial")
+        win.geometry("760x420")
+        win.minsize(520, 300)
+        win.grid_rowconfigure(1, weight=1)
+        win.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(win, fg_color=("gray85", "gray20"))
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            header,
+            text="Monitor Serial",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, padx=(10, 6), pady=6, sticky="w")
+
+        ctk.CTkLabel(
+            header,
+            textvariable=self.serial_status_var,
+            font=ctk.CTkFont(size=10),
+            text_color=("gray45", "#7ec8e3"),
+            anchor="w",
+        ).grid(row=0, column=1, padx=4, pady=6, sticky="ew")
+
+        ctk.CTkCheckBox(
+            header,
+            text="Timestamp",
+            variable=self.serial_timestamps_var,
+            width=90,
+        ).grid(row=0, column=2, padx=(0, 6), pady=6)
+
+        ctk.CTkCheckBox(
+            header,
+            text="Pausa",
+            variable=self.serial_freeze_var,
+            width=70,
+            command=self._toggle_serial_freeze,
+        ).grid(row=0, column=3, padx=(0, 6), pady=6)
+
+        ctk.CTkButton(
+            header,
+            text="Limpiar",
+            width=70,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            command=self._clear_serial_monitor,
+        ).grid(row=0, column=4, padx=(0, 8), pady=6)
+
+        ctk.CTkButton(
+            header,
+            text="Detener",
+            width=70,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color="#c0392b",
+            hover_color="#922b21",
+            command=self._stop_serial_monitor,
+        ).grid(row=0, column=5, padx=(0, 8), pady=6)
+
+        output_frame = ctk.CTkFrame(win, fg_color=("gray95", "#0d1117"))
+        output_frame.grid(row=1, column=0, sticky="nsew")
+        output_frame.grid_rowconfigure(0, weight=1)
+        output_frame.grid_columnconfigure(0, weight=1)
+
+        output = tk.Text(
+            output_frame,
+            wrap="word",
+            state="disabled",
+            font=("monospace", 11),
+            bg="#0d1117",
+            fg="#d0d0d0",
+            insertbackground="white",
+            selectbackground="#264f78",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=8,
+        )
+        output.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ctk.CTkScrollbar(output_frame, command=output.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        output.configure(yscrollcommand=scrollbar.set)
+
+        self.serial_window = win
+        self.serial_output_text = output
+
+        def on_close() -> None:
+            self._stop_serial_monitor()
+            self.serial_window = None
+            self.serial_output_text = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        self._serial_append_output("[Consola serial lista]\n")
+
+    def _clear_serial_monitor(self) -> None:
+        if self.serial_output_text is None:
+            return
+        self.serial_paused_buffer.clear()
+        self.serial_output_text.configure(state="normal")
+        self.serial_output_text.delete("1.0", "end")
+        self.serial_output_text.configure(state="disabled")
+
+    def _toggle_serial_freeze(self) -> None:
+        if self.serial_freeze_var.get():
+            self.serial_status_var.set("Monitor serial en pausa")
+            return
+
+        # Flush buffered lines when pause/freeze is disabled.
+        if self.serial_paused_buffer:
+            buffered = "".join(self.serial_paused_buffer)
+            self.serial_paused_buffer.clear()
+            self._serial_append_output(buffered)
+
+        if self.serial_terminal_manager and self.serial_terminal_manager.has_active_process():
+            self.serial_status_var.set("Monitor serial activo")
+        else:
+            self.serial_status_var.set("Monitor serial inactivo")
+
+    def _format_serial_with_timestamps(self, text: str) -> str:
+        if not self.serial_timestamps_var.get():
+            return text
+
+        lines = text.splitlines(keepends=True)
+        if not lines:
+            return text
+
+        stamp = datetime.now().strftime("%H:%M:%S")
+        out: list[str] = []
+        for line in lines:
+            if line.strip():
+                out.append(f"[{stamp}] {line}")
+            else:
+                out.append(line)
+        return "".join(out)
+
+    def _serial_append_output(self, text: str) -> None:
+        if self.serial_output_text is None:
+            return
+        self.serial_output_text.configure(state="normal")
+        self.serial_output_text.insert("end", text)
+        self.serial_output_text.configure(state="disabled")
+        if not self.serial_freeze_var.get():
+            self.serial_output_text.see("end")
+
+    def _on_serial_monitor_output(self, text: str) -> None:
+        # Called from TerminalManager worker thread: always marshal to UI thread.
+        self.after(0, self._handle_serial_monitor_output_main, text)
+
+    def _handle_serial_monitor_output_main(self, text: str) -> None:
+        formatted = self._format_serial_with_timestamps(text)
+        if self.serial_freeze_var.get():
+            self.serial_paused_buffer.append(formatted)
+            if len(self.serial_paused_buffer) > self.serial_paused_buffer_max:
+                # Keep most recent chunks to avoid unbounded memory growth.
+                self.serial_paused_buffer = self.serial_paused_buffer[-self.serial_paused_buffer_max:]
+            buffered_count = len(self.serial_paused_buffer)
+            self.serial_status_var.set(f"Monitor serial en pausa ({buffered_count} bloques en buffer)")
+        else:
+            self._serial_append_output(formatted)
+        if "[Done]" in text or "Process exited" in text:
+            self.serial_status_var.set("Monitor serial inactivo")
+
     def _schedule_next_device_poll(self) -> None:
         if self._device_poll_job is not None:
             try:
@@ -583,35 +1064,66 @@ class WillyApp(ctk.CTk):
                     for name in os.listdir(schem_dir)
                     if name.lower().endswith(".svg")
                 ]
-                if svgs:
-                    latest_svg = max(svgs, key=os.path.getmtime)
+                session_svgs = [
+                    path for path in svgs
+                    if os.path.getmtime(path) >= (self._app_session_start_ts - 1.0)
+                ]
+                if session_svgs:
+                    latest_svg = max(session_svgs, key=os.path.getmtime)
 
                 boms = [
                     os.path.join(schem_dir, name)
                     for name in os.listdir(schem_dir)
                     if name.lower().endswith("_bom.csv")
                 ]
-                if boms:
-                    latest_bom = max(boms, key=os.path.getmtime)
+                session_boms = [
+                    path for path in boms
+                    if os.path.getmtime(path) >= (self._app_session_start_ts - 1.0)
+                ]
+                if session_boms:
+                    latest_bom = max(session_boms, key=os.path.getmtime)
         except Exception:
             latest_svg = ""
             latest_bom = ""
 
-        self._latest_schematic_path = latest_svg
-        self._latest_bom_path = latest_bom
+        # Keep already-known generated paths in this session if scan didn't find newer files.
+        if latest_svg:
+            self._latest_schematic_path = latest_svg
+        if latest_bom:
+            self._latest_bom_path = latest_bom
 
         if hasattr(self, "diagram_status_label"):
-            if latest_svg:
-                display_name = os.path.basename(latest_svg)
+            if self._latest_schematic_path and os.path.isfile(self._latest_schematic_path):
+                display_name = os.path.basename(self._latest_schematic_path)
                 self.diagram_status_label.configure(text=f"Diagrama: {display_name}")
                 self.diagram_open_btn.configure(state="normal")
             else:
-                self.diagram_status_label.configure(text="Diagrama: sin generar")
+                self.diagram_status_label.configure(text="Diagrama: sin generar en esta sesión")
                 self.diagram_open_btn.configure(state="disabled")
 
-        self._update_schematic_preview(latest_svg)
+        self._update_schematic_preview(self._latest_schematic_path)
 
         self._schedule_next_diagram_poll()
+
+    def _handle_tk_exception(self, exc_type, exc_value, exc_tb) -> None:
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        self.session_logger.log_error(
+            "tkinter",
+            str(exc_value),
+            context={"traceback": tb_text},
+        )
+        self._on_ai_message("error", f"UI exception: {exc_value}")
+
+    def _handle_thread_exception(self, args) -> None:
+        tb_text = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        self.session_logger.log_error(
+            "thread",
+            str(args.exc_value),
+            context={
+                "thread_name": getattr(args.thread, "name", "unknown"),
+                "traceback": tb_text,
+            },
+        )
 
     def _update_schematic_preview(self, svg_path: str) -> None:
         if not hasattr(self, "diagram_preview"):
@@ -632,7 +1144,7 @@ class WillyApp(ctk.CTk):
             preview_cache = os.path.splitext(svg_path)[0] + "_preview.png"
             try:
                 if cairosvg is not None:
-                    cairosvg.svg2png(url=svg_path, write_to=preview_cache, output_width=520)
+                    cairosvg.svg2png(url=svg_path, write_to=preview_cache, output_width=900)
                     source_image_path = preview_cache
             except Exception:
                 source_image_path = ""
@@ -648,7 +1160,7 @@ class WillyApp(ctk.CTk):
 
         try:
             image = Image.open(source_image_path)
-            image.thumbnail((520, 150), Image.Resampling.LANCZOS)
+            image.thumbnail((760, 300), Image.Resampling.LANCZOS)
             self._schematic_preview_photo = ImageTk.PhotoImage(image)
             self._schematic_preview_image = image
             self.diagram_preview.configure(image=self._schematic_preview_photo, text="")
