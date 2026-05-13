@@ -9,7 +9,6 @@ import subprocess
 import json
 import re
 import os
-import sys
 from typing import Dict, List, Optional, Callable, Tuple
 from pathlib import Path
 
@@ -383,6 +382,154 @@ class ArduinoManager:
             "cpu": "?",
             "connectivity": [],
         })
+
+    def _history_file_path(self, project_path: str) -> str:
+        return os.path.join(project_path, ".willy_build_history.json")
+
+    def _load_project_history(self, project_path: str) -> List[Dict]:
+        history_path = self._history_file_path(project_path)
+        if not os.path.exists(history_path):
+            return []
+        try:
+            with open(history_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_project_history(self, project_path: str, history: List[Dict]) -> None:
+        history_path = self._history_file_path(project_path)
+        trimmed = history[-100:]
+        try:
+            with open(history_path, "w", encoding="utf-8") as fh:
+                json.dump(trimmed, fh, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            self.on_error(f"Build history save warning: {exc}")
+
+    def _append_project_history(
+        self,
+        project_path: str,
+        action: str,
+        success: bool,
+        env: Optional[str] = None,
+        port: Optional[str] = None,
+        error_msg: str = "",
+        notes: str = "",
+        changes: Optional[List[str]] = None,
+        time_seconds: float = 0.0,
+    ) -> None:
+        from datetime import datetime
+
+        history = self._load_project_history(project_path)
+        history.append({
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "action": action,
+            "success": bool(success),
+            "env": env or "",
+            "port": port or "",
+            "error": (error_msg or "")[:500],
+            "notes": (notes or "")[:1200],
+            "changes": changes or [],
+            "time_seconds": round(float(time_seconds), 3),
+        })
+        self._save_project_history(project_path, history)
+
+    def _recent_project_history_summary(self, project_path: str, limit: int = 5) -> str:
+        history = self._load_project_history(project_path)
+        if not history:
+            return ""
+
+        recent = history[-limit:]
+        lines = ["Recent project history:"]
+        for idx, item in enumerate(reversed(recent), start=1):
+            ok = "OK" if item.get("success") else "FAIL"
+            action = str(item.get("action", "?")).upper()
+            env = item.get("env") or "default"
+            port = item.get("port")
+            port_part = f" @ {port}" if port else ""
+            err = str(item.get("error", "")).strip()
+            err_part = f" - {err[:90]}" if err else ""
+            lines.append(f"  {idx}. [{ok}] {action} ({env}{port_part}){err_part}")
+        return "\n".join(lines)
+
+    def _preflight_before_build_upload(
+        self,
+        project_path: str,
+        env: Optional[str] = None,
+        action: str = "build",
+        port: Optional[str] = None,
+    ) -> Tuple[bool, List[str], str]:
+        messages: List[str] = []
+
+        if not self.platformio_path:
+            return False, messages, "PlatformIO not available"
+
+        if not os.path.isdir(project_path):
+            return False, messages, f"Project directory not found: {project_path}"
+
+        ini_path = os.path.join(project_path, "platformio.ini")
+        if not os.path.exists(ini_path):
+            return False, messages, f"platformio.ini not found in {project_path}"
+
+        info = self.get_project_info(project_path)
+        if not info.get("ok"):
+            return False, messages, info.get("error", "Could not inspect project metadata")
+
+        envs = [str(e).strip().lower() for e in info.get("environments", []) if str(e).strip()]
+        if env and envs and env.strip().lower() not in envs:
+            return False, messages, f"Environment '{env}' not found in platformio.ini ({', '.join(envs)})"
+
+        prep_msg = self._prepare_platformio_sources(project_path)
+        if prep_msg:
+            messages.append(prep_msg)
+
+        try:
+            main_cpp = os.path.join(project_path, "src", "main.cpp")
+            if os.path.exists(main_cpp):
+                with open(main_cpp, "r", encoding="utf-8", errors="replace") as fh:
+                    source_text = fh.read()
+            else:
+                source_text = ""
+            dep_msg = self._ensure_lib_deps_from_source(project_path, source_text)
+            if dep_msg:
+                messages.append(dep_msg)
+        except Exception as exc:  # noqa: BLE001
+            return False, messages, f"Dependency preflight failed: {exc}"
+
+        if action == "upload":
+            if not port:
+                return False, messages, "No serial port provided for upload"
+            if not os.path.exists(port):
+                return False, messages, f"Serial port not found: {port}"
+            if not os.access(port, os.R_OK | os.W_OK):
+                return False, messages, f"No read/write permission on serial port: {port}"
+
+        # Mandatory dependency sync before build/upload.
+        cmd = [self.platformio_path, "pkg", "install"]
+        if env:
+            cmd.extend(["-e", env])
+        try:
+            self.on_status("Preflight: verificando librerias...")
+            pkg_result = subprocess.run(
+                cmd,
+                cwd=project_path,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            return False, messages, "Preflight timeout: pio pkg install (>3 min)"
+        except Exception as exc:  # noqa: BLE001
+            return False, messages, f"Preflight package install error: {exc}"
+
+        pkg_output = (pkg_result.stdout + pkg_result.stderr).strip()
+        if pkg_result.returncode != 0:
+            return False, messages, f"Preflight package install failed: {pkg_output[:500]}"
+
+        if pkg_output:
+            messages.append("Dependency sync OK (pio pkg install).")
+
+        return True, messages, ""
     
     def build_sketch(
         self,
@@ -404,69 +551,121 @@ class ArduinoManager:
                 "time_seconds": float
             }
         """
-        if not self.platformio_path:
+        import time
+
+        start = time.time()
+        history_summary = self._recent_project_history_summary(project_path)
+
+        ok_preflight, preflight_msgs, preflight_err = self._preflight_before_build_upload(
+            project_path,
+            env=env,
+            action="build",
+        )
+
+        if not ok_preflight:
+            elapsed = time.time() - start
+            self._append_project_history(
+                project_path,
+                action="preflight",
+                success=False,
+                env=env,
+                error_msg=preflight_err,
+                notes="\n".join(preflight_msgs),
+                time_seconds=elapsed,
+            )
             return {
                 "ok": False,
-                "output": "",
-                "error": "PlatformIO not available",
-                "time_seconds": 0,
-            }
-        
-        if not os.path.isdir(project_path):
-            return {
-                "ok": False,
-                "output": "",
-                "error": f"Project directory not found: {project_path}",
-                "time_seconds": 0,
+                "output": ("\n\n".join([x for x in [history_summary, "\n".join(preflight_msgs)] if x])).strip(),
+                "error": preflight_err,
+                "time_seconds": elapsed,
             }
 
-        prep_msg = self._prepare_platformio_sources(project_path)
-        
         try:
             self.on_status(f"Building {project_path}...")
-            
             cmd = [self.platformio_path, "run"]
             if env:
                 cmd.extend(["-e", env])
-            
+
             result = subprocess.run(
                 cmd,
                 cwd=project_path,
                 capture_output=True,
                 text=True,
-                timeout=300,  # 5 min timeout
+                timeout=300,
             )
-            
-            output = result.stdout + result.stderr
-            
+            output = (result.stdout + result.stderr).strip()
+            elapsed = time.time() - start
+
             if result.returncode == 0:
                 self.on_status("Build successful")
+                self._append_project_history(
+                    project_path,
+                    action="build",
+                    success=True,
+                    env=env,
+                    notes=output[:1200],
+                    changes=preflight_msgs,
+                    time_seconds=elapsed,
+                )
                 return {
                     "ok": True,
-                    "output": (prep_msg + "\n\n" + output).strip() if prep_msg else output,
+                    "output": ("\n\n".join([x for x in [history_summary, "\n".join(preflight_msgs), output] if x])).strip(),
                     "error": "",
-                    "time_seconds": 0,
+                    "time_seconds": elapsed,
                 }
-            else:
-                return {
-                    "ok": False,
-                    "output": (prep_msg + "\n\n" + output).strip() if prep_msg else output,
-                    "error": f"Build failed (exit code {result.returncode})",
-                    "time_seconds": 0,
-                }
-        except subprocess.TimeoutExpired:
+
+            error_msg = f"Build failed (exit code {result.returncode})"
+            self._append_project_history(
+                project_path,
+                action="build",
+                success=False,
+                env=env,
+                error_msg=error_msg,
+                notes=output[:1200],
+                changes=preflight_msgs,
+                time_seconds=elapsed,
+            )
             return {
                 "ok": False,
-                "output": "",
-                "error": "Build timeout (>5 min)",
-                "time_seconds": 300,
+                "output": ("\n\n".join([x for x in [history_summary, "\n".join(preflight_msgs), output] if x])).strip(),
+                "error": error_msg,
+                "time_seconds": elapsed,
             }
-        except Exception as e:
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - start
+            self._append_project_history(
+                project_path,
+                action="build",
+                success=False,
+                env=env,
+                error_msg="Build timeout (>5 min)",
+                notes="",
+                changes=preflight_msgs,
+                time_seconds=elapsed,
+            )
             return {
                 "ok": False,
-                "output": "",
-                "error": str(e),
-                "time_seconds": 0,
+                "output": ("\n\n".join([x for x in [history_summary, "\n".join(preflight_msgs)] if x])).strip(),
+                "error": "Build timeout (>5 min)",
+                "time_seconds": elapsed,
+            }
+        except Exception as exc:  # noqa: BLE001
+            elapsed = time.time() - start
+            self._append_project_history(
+                project_path,
+                action="build",
+                success=False,
+                env=env,
+                error_msg=str(exc),
+                notes="",
+                changes=preflight_msgs,
+                time_seconds=elapsed,
+            )
+            return {
+                "ok": False,
+                "output": ("\n\n".join([x for x in [history_summary, "\n".join(preflight_msgs)] if x])).strip(),
+                "error": str(exc),
+                "time_seconds": elapsed,
             }
     
     def upload_firmware(
@@ -491,79 +690,128 @@ class ArduinoManager:
                 "time_seconds": float
             }
         """
-        if not self.platformio_path:
+        import time
+
+        start = time.time()
+        history_summary = self._recent_project_history_summary(project_path)
+
+        ok_preflight, preflight_msgs, preflight_err = self._preflight_before_build_upload(
+            project_path,
+            env=env,
+            action="upload",
+            port=port,
+        )
+
+        if not ok_preflight:
+            elapsed = time.time() - start
+            self._append_project_history(
+                project_path,
+                action="preflight",
+                success=False,
+                env=env,
+                port=port,
+                error_msg=preflight_err,
+                notes="\n".join(preflight_msgs),
+                time_seconds=elapsed,
+            )
             return {
                 "ok": False,
-                "output": "",
-                "error": "PlatformIO not available",
-                "time_seconds": 0,
-            }
-        
-        if not os.path.isdir(project_path):
-            return {
-                "ok": False,
-                "output": "",
-                "error": f"Project directory not found: {project_path}",
-                "time_seconds": 0,
+                "output": ("\n\n".join([x for x in [history_summary, "\n".join(preflight_msgs)] if x])).strip(),
+                "error": preflight_err,
+                "time_seconds": elapsed,
             }
 
-        prep_msg = self._prepare_platformio_sources(project_path)
-        
-        # Check port access
-        if not os.path.exists(port):
-            return {
-                "ok": False,
-                "output": "",
-                "error": f"Serial port not found: {port}",
-                "time_seconds": 0,
-            }
-        
         try:
             self.on_status(f"Uploading to {port}...")
-            
             cmd = [self.platformio_path, "run", "--target", "upload"]
             if env:
                 cmd.extend(["-e", env])
             cmd.extend(["--upload-port", port])
-            
+
             result = subprocess.run(
                 cmd,
                 cwd=project_path,
                 capture_output=True,
                 text=True,
-                timeout=300,  # 5 min timeout
+                timeout=300,
             )
-            
-            output = result.stdout + result.stderr
-            
+            output = (result.stdout + result.stderr).strip()
+            elapsed = time.time() - start
+
             if result.returncode == 0:
                 self.on_status("Upload successful ✓")
+                self._append_project_history(
+                    project_path,
+                    action="upload",
+                    success=True,
+                    env=env,
+                    port=port,
+                    notes=output[:1200],
+                    changes=preflight_msgs,
+                    time_seconds=elapsed,
+                )
                 return {
                     "ok": True,
-                    "output": (prep_msg + "\n\n" + output).strip() if prep_msg else output,
+                    "output": ("\n\n".join([x for x in [history_summary, "\n".join(preflight_msgs), output] if x])).strip(),
                     "error": "",
-                    "time_seconds": 0,
+                    "time_seconds": elapsed,
                 }
-            else:
-                return {
-                    "ok": False,
-                    "output": (prep_msg + "\n\n" + output).strip() if prep_msg else output,
-                    "error": f"Upload failed (exit code {result.returncode})",
-                    "time_seconds": 0,
-                }
-        except subprocess.TimeoutExpired:
+
+            error_msg = f"Upload failed (exit code {result.returncode})"
+            self._append_project_history(
+                project_path,
+                action="upload",
+                success=False,
+                env=env,
+                port=port,
+                error_msg=error_msg,
+                notes=output[:1200],
+                changes=preflight_msgs,
+                time_seconds=elapsed,
+            )
             return {
                 "ok": False,
-                "output": "",
-                "error": "Upload timeout (>5 min)",
-                "time_seconds": 300,
+                "output": ("\n\n".join([x for x in [history_summary, "\n".join(preflight_msgs), output] if x])).strip(),
+                "error": error_msg,
+                "time_seconds": elapsed,
             }
-        except Exception as e:
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - start
+            self._append_project_history(
+                project_path,
+                action="upload",
+                success=False,
+                env=env,
+                port=port,
+                error_msg="Upload timeout (>5 min)",
+                notes="",
+                changes=preflight_msgs,
+                time_seconds=elapsed,
+            )
             return {
                 "ok": False,
-                "output": "",
-                "error": str(e),
-                "time_seconds": 0,
+                "output": ("\n\n".join([x for x in [history_summary, "\n".join(preflight_msgs)] if x])).strip(),
+                "error": "Upload timeout (>5 min)",
+                "time_seconds": elapsed,
+            }
+        except Exception as exc:  # noqa: BLE001
+            elapsed = time.time() - start
+            self._append_project_history(
+                project_path,
+                action="upload",
+                success=False,
+                env=env,
+                port=port,
+                error_msg=str(exc),
+                notes="",
+                changes=preflight_msgs,
+                time_seconds=elapsed,
+            )
+            return {
+                "ok": False,
+                "output": ("\n\n".join([x for x in [history_summary, "\n".join(preflight_msgs)] if x])).strip(),
+                "error": str(exc),
+                "time_seconds": elapsed,
             }
     
     def get_project_info(self, project_path: str) -> Dict:
@@ -727,15 +975,33 @@ class ArduinoManager:
         needed: List[str] = []
         if "tm1637display.h" in includes:
             needed.append("https://github.com/avishorp/TM1637.git")
-
-        if not needed:
-            return ""
+        if "rtclib.h" in includes:
+            needed.append("adafruit/RTClib@^1.14.2")
+        if "liquidcrystal_i2c.h" in includes:
+            needed.append("johnrickman/LiquidCrystal_I2C@^1.1.4")
 
         with open(ini_path, "r", encoding="utf-8", errors="replace") as fh:
             content = fh.read()
 
+        # Auto-fix known invalid/deprecated dependency aliases seen in logs.
+        bad_aliases = [
+            "marcoschwartz/LiquidCrystal I2C @ ^1.1.4",
+            "marcoschwartz/LiquidCrystal I2C@^1.1.4",
+            "marcoschwartz/LiquidCrystal I2C",
+        ]
+        replacement = "johnrickman/LiquidCrystal_I2C@^1.1.4"
+        alias_fixed = False
+        for alias in bad_aliases:
+            if alias in content:
+                content = content.replace(alias, replacement)
+                alias_fixed = True
+
+        if not needed and not alias_fixed:
+            return ""
+
         changed = False
         lines = content.splitlines()
+        content_l = content.lower()
 
         if "lib_deps" not in content:
             # Insert a new lib_deps block into the first env section.
@@ -760,16 +1026,20 @@ class ArduinoManager:
                     insert_at += 1
 
                 for dep in needed:
-                    if dep not in content:
+                    if dep.lower() not in content_l:
                         lines.insert(insert_at, f"    {dep}")
                         insert_at += 1
                         changed = True
 
-        if changed:
+        if changed or alias_fixed:
             content = "\n".join(lines).rstrip() + "\n"
             with open(ini_path, "w", encoding="utf-8") as fh:
                 fh.write(content)
-            return "Updated platformio.ini with inferred lib_deps."
+            if changed and alias_fixed:
+                return "Updated platformio.ini with inferred lib_deps and fixed invalid library aliases."
+            if changed:
+                return "Updated platformio.ini with inferred lib_deps."
+            return "Fixed invalid library aliases in platformio.ini."
         return ""
 
     def _prepare_platformio_sources(self, project_path: str) -> str:

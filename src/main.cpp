@@ -9,7 +9,7 @@
 TM1637Display display(CLK, DIO);
 
 void setup() {
-  display.setBrightness(0x0f); // Establecer el brillo en el valor máximo
+  display.setBrightness(6); // ~80% en rango 0-7 de la libreria TM1637
 }
 
 void loop() {

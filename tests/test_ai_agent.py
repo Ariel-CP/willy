@@ -66,3 +66,48 @@ def test_resolve_project_env_prefers_uno_from_detected_board() -> None:
 
     assert env == "uno"
     assert "arduino_uno" in note
+
+
+def test_resolve_project_env_uses_requested_env_when_available() -> None:
+    agent = _agent()
+
+    env, note = agent._resolve_project_env(
+        "/tmp/project",
+        requested_env="ESP32DEV",
+        port=None,
+    )
+
+    assert env == "esp32dev"
+    assert "requested env" in note.lower()
+
+
+def test_resolve_project_env_falls_back_to_project_default() -> None:
+    class ManagerNoDevices:
+        def get_project_info(self, _project_path: str):
+            return {
+                "ok": True,
+                "environments": ["uno", "esp32dev"],
+                "default_env": "esp32dev",
+                "error": "",
+            }
+
+        def detect_microcontrollers(self):
+            return []
+
+    agent = AIAgent(
+        config={"default_board": ""},
+        terminal_manager=DummyTM(),
+        on_message=lambda _r, _t: None,
+        on_confirm_request=lambda _title, _detail, callback: callback(True),
+        on_status=lambda _s: None,
+        arduino_manager=ManagerNoDevices(),
+    )
+
+    env, note = agent._resolve_project_env(
+        "/tmp/project",
+        requested_env=None,
+        port=None,
+    )
+
+    assert env == "esp32dev"
+    assert "project default" in note.lower()

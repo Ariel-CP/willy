@@ -30,7 +30,6 @@ from app.session_logger import SessionLogger
 from app.tts import TTSEngine
 from app.arduino_manager import ArduinoManager
 from app import i18n
-from app.clippy_widget import ClippyWidget
 
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
@@ -88,6 +87,10 @@ class WillyApp(ctk.CTk):
         self.serial_freeze_var = tk.BooleanVar(value=False)
         self.serial_paused_buffer: list[str] = []
         self.serial_paused_buffer_max = 5000
+        self._current_code_path = ""
+        self._code_expand_window = None
+        self._code_expand_text = None
+        self._iot_action_running = False
 
         self._build_layout()
         self._wire_up()
@@ -147,26 +150,41 @@ class WillyApp(ctk.CTk):
         )
         self.chat_panel.grid(row=0, column=1, sticky="nsew", padx=(1, 1))
 
-        # --- ClippyWidget dentro del chat ---
-        self.clippy = ClippyWidget(self.chat_panel, size=72)
-        self.clippy.enable_drag()
-        self.clippy.set_drag_end_callback(self._save_clippy_position)
-        self.after_idle(self._restore_clippy_position)
-
         self.right_panel = ctk.CTkFrame(self, fg_color=("gray92", "#0a0f14"))
         self.right_panel.grid(row=0, column=2, sticky="nsew")
         self.right_panel.grid_columnconfigure(0, weight=1)
-        self.right_panel.grid_rowconfigure(0, minsize=260)
-        self.right_panel.grid_rowconfigure(1, weight=1)
+        self.right_panel.grid_rowconfigure(0, weight=1)
 
-        self._build_iot_dashboard(self.right_panel)
+        self.right_splitter = tk.PanedWindow(
+            self.right_panel,
+            orient=tk.VERTICAL,
+            sashwidth=8,
+            bd=0,
+            relief="flat",
+            bg="#0a0f14",
+        )
+        self.right_splitter.grid(row=0, column=0, sticky="nsew")
+
+        self.dashboard_container = ctk.CTkFrame(self.right_panel, fg_color=("gray92", "#0a0f14"))
+        self.terminal_container = ctk.CTkFrame(self.right_panel, fg_color=("gray92", "#0a0f14"))
+        self.dashboard_container.grid_rowconfigure(0, weight=1)
+        self.dashboard_container.grid_columnconfigure(0, weight=1)
+        self.terminal_container.grid_rowconfigure(0, weight=1)
+        self.terminal_container.grid_columnconfigure(0, weight=1)
+
+        self.right_splitter.add(self.dashboard_container, minsize=260)
+        self.right_splitter.add(self.terminal_container, minsize=150)
+
+        self._build_iot_dashboard(self.dashboard_container)
 
         self.terminal_panel = TerminalPanel(
-            self.right_panel,
+            self.terminal_container,
             terminal_manager=self.terminal_manager,
             fg_color=("gray92", "#0a0f14"),
         )
-        self.terminal_panel.grid(row=1, column=0, sticky="nsew")
+        self.terminal_panel.grid(row=0, column=0, sticky="nsew")
+
+        self.after(150, lambda: self.right_splitter.sash_place(0, 1, 360))
 
         status_bar = ctk.CTkFrame(self, height=22, fg_color=("gray80", "gray18"))
         status_bar.grid(row=1, column=0, columnspan=3, sticky="ew")
@@ -444,6 +462,55 @@ class WillyApp(ctk.CTk):
             anchor="w",
         ).grid(row=7, column=0, sticky="w", padx=8, pady=(2, 2))
 
+        code_actions = ctk.CTkFrame(dashboard, fg_color="transparent")
+        code_actions.grid(row=7, column=0, sticky="e", padx=8, pady=(2, 2))
+
+        self.code_action_indicator = tk.Canvas(
+            code_actions,
+            width=16,
+            height=16,
+            highlightthickness=0,
+            bd=0,
+            bg="#111821",
+        )
+        self.code_action_indicator.pack(side="left", padx=(0, 6))
+
+        self.compile_btn = ctk.CTkButton(
+            code_actions,
+            text="Compilar",
+            width=88,
+            height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            command=self._start_compile,
+        )
+        self.compile_btn.pack(side="left", padx=(0, 4))
+
+        self.upload_btn = ctk.CTkButton(
+            code_actions,
+            text="Grabar",
+            width=82,
+            height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="#16a34a",
+            hover_color="#15803d",
+            command=self._start_upload,
+        )
+        self.upload_btn.pack(side="left", padx=(0, 4))
+
+        self.expand_code_btn = ctk.CTkButton(
+            code_actions,
+            text="Expandir",
+            width=86,
+            height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=self._open_expanded_code_view,
+        )
+        self.expand_code_btn.pack(side="left")
+
         self.code_preview = ctk.CTkTextbox(
             dashboard,
             height=140,
@@ -458,6 +525,7 @@ class WillyApp(ctk.CTk):
         self.code_preview.configure(state="disabled")
 
         self._set_device_indicator(False)
+        self._set_code_action_indicator("idle")
 
     # ------------------------------------------------------------------
     # Wiring
@@ -479,7 +547,8 @@ class WillyApp(ctk.CTk):
         def _logged_send(text: str) -> None:
             self.session_logger.log_message("user", text)
             # Reacción: pensando cuando el usuario escribe
-            self.clippy.set_expression("thinking")
+            if hasattr(self, "clippy") and self.clippy is not None:
+                self.clippy.set_expression("thinking")
             self.ai_agent.send(text)
 
         self.chat_panel.set_send_callback(_logged_send)
@@ -546,6 +615,8 @@ class WillyApp(ctk.CTk):
         self.session_logger.log_message(role, text)
         if role == "error":
             self.session_logger.log_error("ai_agent", text)
+        if not hasattr(self, "clippy") or self.clippy is None:
+            return
         # Reacciones suaves para un asistente amigable orientado a adultos mayores.
         if role == "assistant":
             if "Web results for:" in text or "Source URL:" in text:
@@ -562,7 +633,8 @@ class WillyApp(ctk.CTk):
     def _on_confirm_request(self, title: str, detail: str, callback) -> None:
         self.chat_panel.show_confirm_dialog(title, detail, callback)
         # Reacción: parpadeo cuando se pide confirmación
-        self.clippy.blink()
+        if hasattr(self, "clippy") and self.clippy is not None:
+            self.clippy.blink()
 
     def _on_status(self, text: str) -> None:
         self.chat_panel.set_status(text)
@@ -659,6 +731,7 @@ class WillyApp(ctk.CTk):
         self.session_logger.log_error(component, message)
 
     def _on_file_selected(self, path: str) -> None:
+        self._current_code_path = path
         self.chat_panel.add_message("system", i18n.get("file_selected", path=path))
         self._update_code_preview(path)
         self.ai_agent.send(i18n.get("file_send_msg", path=path))
@@ -686,6 +759,7 @@ class WillyApp(ctk.CTk):
         self.after(0, self._update_code_preview_from_content, path, content)
 
     def _update_code_preview_from_content(self, path: str, content: str) -> None:
+        self._current_code_path = path
         preview = f"Archivo (editado por Willy): {path}\n\n{content}"
         if len(preview) > 6500:
             preview = preview[:6500] + "\n\n[...archivo truncado en 6500 caracteres...]"
@@ -696,12 +770,189 @@ class WillyApp(ctk.CTk):
             self.code_preview.insert("0.0", preview)
             self.code_preview.configure(state="disabled")
 
+        if self._code_expand_text is not None and self._code_expand_text.winfo_exists():
+            self._code_expand_text.configure(state="normal")
+            self._code_expand_text.delete("0.0", "end")
+            self._code_expand_text.insert("0.0", preview)
+            self._code_expand_text.configure(state="disabled")
+
     def _set_device_indicator(self, connected: bool) -> None:
         if not hasattr(self, "device_indicator"):
             return
         self.device_indicator.delete("all")
         color = "#22c55e" if connected else "#ef4444"
         self.device_indicator.create_oval(3, 3, 17, 17, fill=color, outline=color)
+
+    def _set_code_action_indicator(self, state: str) -> None:
+        if not hasattr(self, "code_action_indicator"):
+            return
+        colors = {
+            "idle": "#6b7280",
+            "compiling": "#2563eb",
+            "uploading": "#f59e0b",
+            "success": "#22c55e",
+            "error": "#ef4444",
+        }
+        color = colors.get(state, colors["idle"])
+        self.code_action_indicator.delete("all")
+        self.code_action_indicator.create_oval(3, 3, 13, 13, fill=color, outline=color)
+
+    def _resolve_project_path_for_actions(self) -> str:
+        candidates: list[str] = []
+        if self._current_code_path:
+            candidates.append(os.path.abspath(self._current_code_path))
+        candidates.append(os.path.join(self.terminal_manager.get_cwd(), "src", "main.cpp"))
+
+        for file_candidate in candidates:
+            base = file_candidate if os.path.isdir(file_candidate) else os.path.dirname(file_candidate)
+            cur = os.path.abspath(base)
+            while True:
+                if os.path.exists(os.path.join(cur, "platformio.ini")):
+                    return cur
+                parent = os.path.dirname(cur)
+                if parent == cur:
+                    break
+                cur = parent
+        return self.terminal_manager.get_cwd()
+
+    def _select_env_for_project(self, project_path: str) -> str | None:
+        info = self.arduino_manager.get_project_info(project_path)
+        if not info.get("ok"):
+            return None
+        envs = [str(e).strip() for e in info.get("environments", []) if str(e).strip()]
+        if not envs:
+            return None
+
+        default_env = str(info.get("default_env") or "").strip().lower()
+        if default_env and default_env in [e.lower() for e in envs]:
+            return envs[[e.lower() for e in envs].index(default_env)]
+
+        board_hint = ""
+        selected = self.device_picker_var.get() if hasattr(self, "device_picker_var") else ""
+        if selected and selected != "Sin dispositivos":
+            board_hint = selected.split(" - ", 1)[0].strip().lower()
+        if not board_hint:
+            board_hint = str(self.config_data.get("default_board", "")).strip().lower()
+
+        candidates: list[str] = []
+        if board_hint in {"arduino_uno", "uno"}:
+            candidates = ["uno", "arduino_uno", "arduino-avr-uno"]
+        elif "esp32" in board_hint:
+            candidates = ["esp32", "esp32dev", "esp32-s3", "esp32s3"]
+        elif "pico" in board_hint:
+            candidates = ["pico", "rp2040"]
+        elif board_hint:
+            candidates = [board_hint]
+
+        envs_l = [e.lower() for e in envs]
+        for cand in candidates:
+            if cand in envs_l:
+                return envs[envs_l.index(cand)]
+            for idx, env_name in enumerate(envs_l):
+                if cand in env_name or env_name in cand:
+                    return envs[idx]
+
+        return envs[0]
+
+    def _set_iot_action_buttons_state(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        if hasattr(self, "compile_btn"):
+            self.compile_btn.configure(state=state)
+        if hasattr(self, "upload_btn"):
+            self.upload_btn.configure(state=state)
+
+    def _start_compile(self) -> None:
+        if self._iot_action_running:
+            return
+        self._iot_action_running = True
+        self._set_iot_action_buttons_state(False)
+        self._set_code_action_indicator("compiling")
+        threading.Thread(target=self._compile_worker, daemon=True).start()
+
+    def _compile_worker(self) -> None:
+        project_path = self._resolve_project_path_for_actions()
+        env = self._select_env_for_project(project_path)
+        result = self.arduino_manager.build_sketch(project_path, env)
+        self.after(0, self._finish_compile, result, project_path, env)
+
+    def _finish_compile(self, result: dict, project_path: str, env: str | None) -> None:
+        self._iot_action_running = False
+        self._set_iot_action_buttons_state(True)
+        ok = bool(result.get("ok"))
+        self._set_code_action_indicator("success" if ok else "error")
+        if ok:
+            self._on_status(f"Compilacion OK ({env or 'default'})")
+            self.chat_panel.add_message("system", f"Compilacion completada en {project_path}")
+        else:
+            err = result.get("error", "Error desconocido")
+            self.chat_panel.add_message("error", f"Fallo compilacion: {err}")
+        self.after(2200, lambda: self._set_code_action_indicator("idle"))
+
+    def _start_upload(self) -> None:
+        if self._iot_action_running:
+            return
+        self._iot_action_running = True
+        self._set_iot_action_buttons_state(False)
+        self._set_code_action_indicator("uploading")
+        threading.Thread(target=self._upload_worker, daemon=True).start()
+
+    def _upload_worker(self) -> None:
+        project_path = self._resolve_project_path_for_actions()
+        env = self._select_env_for_project(project_path)
+        port = self._selected_or_default_port()
+        result = self.arduino_manager.upload_firmware(project_path, port, env)
+        self.after(0, self._finish_upload, result, project_path, port, env)
+
+    def _finish_upload(self, result: dict, project_path: str, port: str, env: str | None) -> None:
+        self._iot_action_running = False
+        self._set_iot_action_buttons_state(True)
+        ok = bool(result.get("ok"))
+        self._set_code_action_indicator("success" if ok else "error")
+        if ok:
+            self._on_status(f"Grabacion OK en {port} ({env or 'default'})")
+            self.chat_panel.add_message("system", f"Grabacion completada en {port} desde {project_path}")
+        else:
+            err = result.get("error", "Error desconocido")
+            self.chat_panel.add_message("error", f"Fallo grabacion: {err}")
+        self.after(2200, lambda: self._set_code_action_indicator("idle"))
+
+    def _open_expanded_code_view(self) -> None:
+        if self._code_expand_window is not None and self._code_expand_window.winfo_exists():
+            self._code_expand_window.focus_force()
+            return
+
+        self._code_expand_window = ctk.CTkToplevel(self)
+        self._code_expand_window.title("Codigo en desarrollo")
+        self._code_expand_window.geometry("1100x700")
+        self._code_expand_window.minsize(780, 420)
+        self._code_expand_window.transient(self)
+
+        container = ctk.CTkFrame(self._code_expand_window)
+        container.pack(fill="both", expand=True, padx=12, pady=12)
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+
+        self._code_expand_text = ctk.CTkTextbox(
+            container,
+            font=ctk.CTkFont(family="monospace", size=12),
+            wrap="none",
+            fg_color=("gray96", "#0d1117"),
+            border_color=("gray70", "gray40"),
+            border_width=1,
+        )
+        self._code_expand_text.grid(row=0, column=0, sticky="nsew")
+
+        content = ""
+        if hasattr(self, "code_preview"):
+            try:
+                self.code_preview.configure(state="normal")
+                content = self.code_preview.get("0.0", "end")
+                self.code_preview.configure(state="disabled")
+            except Exception:
+                content = ""
+
+        self._code_expand_text.insert("0.0", content)
+        self._code_expand_text.configure(state="disabled")
 
     def _trigger_device_scan(self) -> None:
         if self._device_scan_running:
@@ -1189,6 +1440,7 @@ class WillyApp(ctk.CTk):
             pass
 
     def _update_code_preview(self, path: str) -> None:
+        self._current_code_path = path
         preview = ""
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -1205,10 +1457,18 @@ class WillyApp(ctk.CTk):
             self.code_preview.insert("0.0", preview)
             self.code_preview.configure(state="disabled")
 
+        if self._code_expand_text is not None and self._code_expand_text.winfo_exists():
+            self._code_expand_text.configure(state="normal")
+            self._code_expand_text.delete("0.0", "end")
+            self._code_expand_text.insert("0.0", preview)
+            self._code_expand_text.configure(state="disabled")
+
     def _clippy_default_position(self) -> tuple[int, int]:
         return 8, 48
 
     def _clamp_clippy_position(self, x: int, y: int) -> tuple[int, int]:
+        if not hasattr(self, "clippy") or self.clippy is None:
+            return 0, 0
         panel_w = max(1, self.chat_panel.winfo_width())
         panel_h = max(1, self.chat_panel.winfo_height())
         widget_w = max(1, self.clippy.winfo_width())
@@ -1218,6 +1478,8 @@ class WillyApp(ctk.CTk):
         return max(0, min(int(x), max_x)), max(0, min(int(y), max_y))
 
     def _restore_clippy_position(self) -> None:
+        if not hasattr(self, "clippy") or self.clippy is None:
+            return
         saved_x = self.config_data.get("clippy_x")
         saved_y = self.config_data.get("clippy_y")
         if isinstance(saved_x, int) and isinstance(saved_y, int):
@@ -1241,6 +1503,8 @@ class WillyApp(ctk.CTk):
         try:
             while True:
                 event_type, value = self._tts_visual_events.get_nowait()
+                if not hasattr(self, "clippy") or self.clippy is None:
+                    continue
                 if event_type == "start":
                     self.clippy.start_spectrum()
                 elif event_type == "energy":
@@ -1270,229 +1534,195 @@ class WillyApp(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _open_settings(self) -> None:
-        dlg = ctk.CTkToplevel(self)
-        dlg.title(i18n.get("settings_title"))
-        dlg.geometry("560x460")
-        dlg.resizable(False, False)
-        dlg.wait_visibility()
-        dlg.grab_set()
+        """Open the improved settings dialog with validation and sync."""
+        settings_window = ctk.CTkToplevel(self)
+        settings_window.title(i18n.get("settings_title"))
+        settings_window.geometry("560x460")
+        settings_window.transient(self)
+        settings_window.update_idletasks()
 
-        dlg.grid_columnconfigure(1, weight=1)
+        def _safe_grab_set() -> None:
+            try:
+                settings_window.grab_set()
+            except tk.TclError:
+                pass
 
-        def row(r, label, widget_factory):
-            ctk.CTkLabel(dlg, text=label, anchor="e").grid(
-                row=r, column=0, padx=(16, 8), pady=8, sticky="e"
-            )
-            w = widget_factory(dlg)
-            w.grid(row=r, column=1, padx=(0, 16), pady=8, sticky="ew")
-            return w
+        settings_window.after(0, _safe_grab_set)
+        settings_window.resizable(False, False)
 
-        api_var = tk.StringVar(value=self.config_data.get("openai_api_key", ""))
-        source_to_label = {
-            "env": i18n.get("api_source_env"),
-            "config": i18n.get("api_source_config"),
-        }
-        label_to_source = {v: k for k, v in source_to_label.items()}
-        api_source_var = tk.StringVar(value=source_to_label[_resolve_api_source(self.config_data)])
+        frame = ctk.CTkFrame(settings_window, corner_radius=14)
+        frame.pack(fill="both", expand=True, padx=18, pady=18)
 
-        row(
-            0,
-            i18n.get("settings_api_source"),
-            lambda p: ctk.CTkOptionMenu(
-                p,
-                variable=api_source_var,
-                values=[source_to_label["env"], source_to_label["config"]],
-                width=220,
-            ),
+        header = ctk.CTkFrame(frame, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(14, 8))
+
+        ctk.CTkLabel(
+            header,
+            text=i18n.get("settings_title"),
+            font=ctk.CTkFont(size=18, weight="bold"),
+            anchor="w",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            header,
+            text="Configura tu API key y carpeta de trabajo por defecto.",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray45", "gray65"),
+            anchor="w",
+        ).pack(anchor="w", pady=(2, 0))
+
+        body = ctk.CTkFrame(frame, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=18, pady=(4, 10))
+
+        # API Key
+        api_card = ctk.CTkFrame(body, corner_radius=12, fg_color=("gray93", "gray17"))
+        api_card.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(
+            api_card,
+            text=i18n.get("settings_api_key"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w"
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+        api_key_var = tk.StringVar(value=self.config_data.get("openai_api_key", ""))
+        api_key_visible = tk.BooleanVar(value=False)
+
+        api_row = ctk.CTkFrame(api_card, fg_color="transparent")
+        api_row.pack(anchor="w", fill="x", padx=12, pady=(0, 8))
+
+        api_key_entry = ctk.CTkEntry(
+            api_row,
+            textvariable=api_key_var,
+            width=390,
+            show="*",
         )
+        api_key_entry.pack(side="left", padx=(0, 8))
 
-        api_row = ctk.CTkFrame(dlg, fg_color="transparent")
-        row(1, i18n.get("settings_api_key"), lambda _p: api_row)
-        api_row.grid_columnconfigure(0, weight=1)
-
-        api_entry = ctk.CTkEntry(api_row, textvariable=api_var, show="*", width=300)
-        api_entry.grid(row=0, column=0, sticky="ew")
-        entry_widget = getattr(api_entry, "_entry", api_entry)
-
-        def _paste_api_key(_event=None):
-            try:
-                text = dlg.clipboard_get()
-            except tk.TclError:
-                return "break"
-
-            entry_widget.focus_set()
-            try:
-                sel_first = entry_widget.index("sel.first")
-                sel_last = entry_widget.index("sel.last")
-                entry_widget.delete(sel_first, sel_last)
-                insert_at = sel_first
-            except tk.TclError:
-                insert_at = entry_widget.index("insert")
-            entry_widget.insert(insert_at, text)
-            return "break"
-
-        # Force common paste shortcuts on Linux/X11 and avoid widget-specific quirks.
-        entry_widget.bind("<Control-v>", _paste_api_key)
-        entry_widget.bind("<Control-V>", _paste_api_key)
-        entry_widget.bind("<Shift-Insert>", _paste_api_key)
-
-        api_menu = tk.Menu(dlg, tearoff=0)
-        api_menu.add_command(label="Pegar", command=_paste_api_key)
-
-        def _show_api_menu(event):
-            entry_widget.focus_set()
-            api_menu.tk_popup(event.x_root, event.y_root)
-            api_menu.grab_release()
-            return "break"
-
-        entry_widget.bind("<Button-3>", _show_api_menu)
-        entry_widget.bind("<Button-2>", _show_api_menu)
-
-        hide_var = tk.BooleanVar(value=True)
-
-        def _toggle_key_visibility() -> None:
-            hide_var.set(not hide_var.get())
-            api_entry.configure(show="*" if hide_var.get() else "")
-            toggle_btn.configure(text=i18n.get("show_btn") if hide_var.get() else i18n.get("hide_btn"))
+        def toggle_api_visibility() -> None:
+            visible = not api_key_visible.get()
+            api_key_visible.set(visible)
+            api_key_entry.configure(show="" if visible else "*")
+            toggle_btn.configure(text=i18n.get("hide_btn") if visible else i18n.get("show_btn"))
 
         toggle_btn = ctk.CTkButton(
             api_row,
             text=i18n.get("show_btn"),
-            width=90,
-            command=_toggle_key_visibility,
+            width=110,
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=toggle_api_visibility,
         )
-        toggle_btn.grid(row=0, column=1, padx=(8, 0))
+        toggle_btn.pack(side="left")
 
-        api_status_label = ctk.CTkLabel(
-            dlg,
-            text="",
+        ctk.CTkLabel(
+            api_card,
+            text="Tip: mantenla oculta al compartir pantalla.",
+            font=ctk.CTkFont(size=10),
+            text_color=("gray45", "gray65"),
             anchor="w",
-            justify="left",
-            text_color=("gray40", "gray60"),
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
+        # Default folder
+        folder_card = ctk.CTkFrame(body, corner_radius=12, fg_color=("gray93", "gray17"))
+        folder_card.pack(fill="x")
+        ctk.CTkLabel(
+            folder_card,
+            text=i18n.get("settings_initial_dir"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w"
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+        folder_var = tk.StringVar(value=self.config_data.get("initial_directory", "~"))
+        folder_row = ctk.CTkFrame(folder_card, fg_color="transparent")
+        folder_row.pack(anchor="w", fill="x", padx=12, pady=(0, 8))
+        folder_entry = ctk.CTkEntry(
+            folder_row,
+            textvariable=folder_var,
+            width=390,
         )
-        api_status_label.grid(row=2, column=1, padx=(0, 16), pady=(0, 8), sticky="w")
+        folder_entry.pack(side="left", padx=(0, 8))
 
-        def _refresh_api_controls(*_args) -> None:
-            selected_source = label_to_source.get(api_source_var.get(), "env")
-            using_env = selected_source == "env"
-            env_key = os.getenv("OPENAI_API_KEY", "").strip()
-            status_ok = i18n.get("api_status_ok")
-            status_missing = i18n.get("api_status_missing")
+        def select_folder():
+            folder = tk.filedialog.askdirectory(initialdir=os.path.expanduser(folder_var.get()))
+            if folder:
+                folder_var.set(folder)
 
-            if using_env:
-                status_text = status_ok if _is_configured_api_key(env_key) else status_missing
-                api_status_label.configure(
-                    text=i18n.get(
-                        "settings_api_hint_env",
-                        env_name="OPENAI_API_KEY",
-                        status=status_text,
-                    )
-                    + "\n"
-                    + i18n.get("settings_api_hint_env_note")
-                )
-            else:
-                status_text = status_ok if _is_configured_api_key(api_var.get()) else status_missing
-                api_status_label.configure(
-                    text=i18n.get(
-                        "settings_api_hint_config",
-                        status=status_text,
-                    )
-                )
+        ctk.CTkButton(
+            folder_row,
+            text=i18n.get("browse_btn") if hasattr(i18n, "get") else "Examinar",
+            width=110,
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=select_folder,
+        ).pack(side="left")
 
-        api_source_var.trace_add("write", _refresh_api_controls)
-        api_var.trace_add("write", _refresh_api_controls)
-        _refresh_api_controls()
+        ctk.CTkLabel(
+            folder_card,
+            text="Se aplicará al terminal y al explorador de archivos.",
+            font=ctk.CTkFont(size=10),
+            text_color=("gray45", "gray65"),
+            anchor="w",
+        ).pack(anchor="w", padx=12, pady=(0, 10))
 
-        model_var = tk.StringVar(value=self.config_data.get("model", "gpt-4o"))
-        row(3, i18n.get("settings_model"), lambda p: ctk.CTkEntry(p, textvariable=model_var, width=300))
+        # Feedback label
+        feedback_var = tk.StringVar(value="")
+        feedback_label = ctk.CTkLabel(
+            frame,
+            textvariable=feedback_var,
+            font=ctk.CTkFont(size=10),
+            text_color="#c0392b",
+            anchor="w"
+        )
+        feedback_label.pack(anchor="w", padx=20, pady=(0, 2))
 
-        dir_var = tk.StringVar(value=self.config_data.get("initial_directory", "~"))
-        row(4, i18n.get("settings_initial_dir"), lambda p: ctk.CTkEntry(p, textvariable=dir_var, width=300))
+        # Action buttons
+        btn_row = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(8, 16))
 
-        theme_var = tk.StringVar(value=self.config_data.get("theme", "dark"))
-        row(5, i18n.get("settings_theme"), lambda p: ctk.CTkOptionMenu(p, variable=theme_var, values=["dark", "light", "system"], width=160))
+        def on_cancel():
+            settings_window.destroy()
 
-        confirm_ro_var = tk.BooleanVar(value=self.config_data.get("confirm_readonly", False))
-        row(6, i18n.get("settings_confirm_readonly"), lambda p: ctk.CTkCheckBox(p, text="", variable=confirm_ro_var))
+        def save_settings():
+            # Validación de carpeta
+            folder = os.path.expanduser(folder_var.get())
+            folder = os.path.abspath(folder)
+            if not os.path.exists(folder):
+                try:
+                    os.makedirs(folder, exist_ok=True)
+                except Exception as e:
+                    feedback_var.set(f"Error: {str(e)}")
+                    return
+            if not os.path.isdir(folder):
+                feedback_var.set("La ruta no es un directorio válido.")
+                return
+            if not os.access(folder, os.W_OK):
+                feedback_var.set("No tienes permisos de escritura en la carpeta.")
+                return
+            # Guardar config
+            self.config_data["openai_api_key"] = api_key_var.get()
+            self.config_data["initial_directory"] = folder
+            with open(CONFIG_PATH, "w", encoding="utf-8") as config_file:
+                json.dump(self.config_data, config_file, indent=4)
+            # Sincronizar terminal y file browser
+            self.terminal_manager.change_directory(folder)
+            if hasattr(self, "file_browser"):
+                self.file_browser.navigate_to(folder)
+            settings_window.destroy()
 
-        lang_display = {"Español": "es", "English": "en"}
-        lang_var = tk.StringVar(value="Español" if self.config_data.get("language", "es") == "es" else "English")
-        row(7, i18n.get("settings_language"), lambda p: ctk.CTkOptionMenu(p, variable=lang_var, values=["Español", "English"], width=160))
-
-        tts_engine_var = tk.StringVar(value=self.config_data.get("tts_engine", "auto"))
-        row(8, "TTS Engine", lambda p: ctk.CTkOptionMenu(p, variable=tts_engine_var, values=["auto", "piper", "espeak"], width=160))
-
-        tts_senior_var = tk.BooleanVar(value=self.config_data.get("tts_senior_mode", True))
-        row(9, "TTS Modo Senior", lambda p: ctk.CTkCheckBox(p, text="", variable=tts_senior_var))
-
-        tts_rate_var = tk.StringVar(value=str(self.config_data.get("tts_rate", "0.90")))
-        row(10, "TTS Velocidad", lambda p: ctk.CTkEntry(p, textvariable=tts_rate_var, width=140))
-
-        piper_model_var = tk.StringVar(value=self.config_data.get("piper_model", ""))
-        row(11, "Piper Model (.onnx)", lambda p: ctk.CTkEntry(p, textvariable=piper_model_var, width=320))
-
-        # Microcontroller Defaults
-        default_board_var = tk.StringVar(value=self.config_data.get("default_board", "esp32"))
-        row(12, "Placa por defecto", lambda p: ctk.CTkOptionMenu(p, variable=default_board_var, values=["esp32", "esp32-s3", "arduino:avr:uno", "arduino:avr:nano", "pico"], width=160))
-
-        default_port_var = tk.StringVar(value=self.config_data.get("default_port", "/dev/ttyUSB0"))
-        row(13, "Puerto Serial", lambda p: ctk.CTkEntry(p, textvariable=default_port_var, width=160))
-
-        confirm_upload_var = tk.BooleanVar(value=self.config_data.get("confirm_upload", True))
-        row(14, "Confirmar Upload", lambda p: ctk.CTkCheckBox(p, text="", variable=confirm_upload_var))
-
-        def _save():
-            selected_source = label_to_source.get(api_source_var.get(), "env")
-            self.config_data["api_key_source"] = selected_source
-            self.config_data["openai_api_key"] = api_var.get().strip()
-            self.config_data["model"] = model_var.get().strip()
-            self.config_data["initial_directory"] = dir_var.get().strip()
-            self.config_data["theme"] = theme_var.get()
-            self.config_data["confirm_readonly"] = confirm_ro_var.get()
-            self.config_data["language"] = lang_display.get(lang_var.get(), "es")
-            self.config_data["tts_engine"] = tts_engine_var.get().strip().lower()
-            self.config_data["tts_senior_mode"] = bool(tts_senior_var.get())
-            try:
-                self.config_data["tts_rate"] = float(tts_rate_var.get().strip())
-            except Exception:
-                self.config_data["tts_rate"] = 0.90
-            self.config_data["piper_model"] = piper_model_var.get().strip()
-            self.config_data["tts_cache_enabled"] = True
-            # Microcontroller settings
-            self.config_data["default_board"] = default_board_var.get().strip()
-            self.config_data["default_port"] = default_port_var.get().strip()
-            self.config_data["confirm_upload"] = bool(confirm_upload_var.get())
-            try:
-                with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
-                    json.dump(self.config_data, fh, indent=4)
-            except Exception:
-                pass
-            ctk.set_appearance_mode(self.config_data["theme"])
-            self.ai_agent.config = self.config_data
-            self.ai_agent._client = None
-            self.tts = TTSEngine(lang=self.config_data.get("language", "es"), config=self.config_data)
-            self.tts.set_volume(0.35)
-            dlg.grab_release()
-            dlg.destroy()
-            from tkinter import messagebox
-            messagebox.showinfo(
-                i18n.get("settings_title"),
-                i18n.get("restart_notice"),
-            )
-
-        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
-        btn_row.grid(row=15, column=0, columnspan=2, pady=(8, 16))
         ctk.CTkButton(
             btn_row,
             text=i18n.get("settings_cancel"),
-            width=90,
-            fg_color=("gray70", "gray35"),
-            hover_color=("gray60", "gray45"),
-            command=lambda: (dlg.grab_release(), dlg.destroy()),
-        ).pack(side="left", padx=8)
+            width=120,
+            fg_color=("gray70", "gray30"),
+            hover_color=("gray60", "gray40"),
+            command=on_cancel,
+        ).pack(side="left", padx=(0, 10))
+
         ctk.CTkButton(
             btn_row,
             text=i18n.get("settings_save"),
-            width=90,
-            command=_save,
-        ).pack(side="left", padx=8)
+            width=150,
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            command=save_settings,
+        ).pack(side="right")
+
+        settings_window.bind("<Escape>", lambda _e: on_cancel())
+        settings_window.bind("<Return>", lambda _e: save_settings())

@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 
 from app.arduino_manager import ArduinoManager
 
@@ -50,3 +51,108 @@ def test_normalize_hwid_extracts_vid_pid() -> None:
     normalized = manager._normalize_hwid(hwid)
 
     assert normalized == "1a86:7523"
+
+
+def test_ensure_lib_deps_infers_rtclib_and_lcd_i2c(tmp_path: Path) -> None:
+    manager = _mgr()
+    ini = tmp_path / "platformio.ini"
+    ini.write_text(
+        "[env:uno]\nplatform = atmelavr\nboard = uno\nframework = arduino\n",
+        encoding="utf-8",
+    )
+
+    source = "#include <RTClib.h>\n#include <LiquidCrystal_I2C.h>\n"
+    msg = manager._ensure_lib_deps_from_source(str(tmp_path), source)
+    content = ini.read_text(encoding="utf-8")
+
+    assert "inferred lib_deps" in msg
+    assert "adafruit/RTClib@^1.14.2" in content
+    assert "johnrickman/LiquidCrystal_I2C@^1.1.4" in content
+
+
+def test_ensure_lib_deps_fixes_invalid_lcd_alias(tmp_path: Path) -> None:
+    manager = _mgr()
+    ini = tmp_path / "platformio.ini"
+    ini.write_text(
+        "[env:uno]\n"
+        "platform = atmelavr\n"
+        "board = uno\n"
+        "framework = arduino\n"
+        "lib_deps =\n"
+        "    marcoschwartz/LiquidCrystal I2C @ ^1.1.4\n",
+        encoding="utf-8",
+    )
+
+    msg = manager._ensure_lib_deps_from_source(str(tmp_path), "")
+    content = ini.read_text(encoding="utf-8")
+
+    assert "invalid library aliases" in msg
+    assert "marcoschwartz/LiquidCrystal I2C" not in content
+    assert "johnrickman/LiquidCrystal_I2C@^1.1.4" in content
+
+
+def test_project_history_roundtrip(tmp_path: Path) -> None:
+    manager = _mgr()
+    project = tmp_path
+    history_file = project / ".willy_build_history.json"
+
+    manager._append_project_history(
+        str(project),
+        action="build",
+        success=False,
+        env="uno",
+        error_msg="compile error",
+        notes="details",
+    )
+    manager._append_project_history(
+        str(project),
+        action="upload",
+        success=True,
+        env="uno",
+        port="/dev/ttyUSB0",
+    )
+
+    assert history_file.exists()
+    hist = manager._load_project_history(str(project))
+    assert len(hist) == 2
+    summary = manager._recent_project_history_summary(str(project))
+    assert "Recent project history" in summary
+    assert "UPLOAD" in summary or "BUILD" in summary
+
+
+def test_preflight_blocks_when_pkg_install_fails(tmp_path: Path) -> None:
+    manager = _mgr()
+    manager.platformio_path = "/bin/false"
+
+    ini = tmp_path / "platformio.ini"
+    ini.write_text(
+        "[env:uno]\nplatform = atmelavr\nboard = uno\nframework = arduino\n",
+        encoding="utf-8",
+    )
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.cpp").write_text("#include <Arduino.h>\nvoid setup(){}\nvoid loop(){}\n", encoding="utf-8")
+
+    ok, _msgs, err = manager._preflight_before_build_upload(str(tmp_path), env="uno", action="build")
+    assert ok is False
+    assert "package install failed" in err.lower()
+
+
+def test_build_blocks_on_preflight_failure(tmp_path: Path) -> None:
+    manager = _mgr()
+    manager.platformio_path = "/bin/echo"
+
+    ini = tmp_path / "platformio.ini"
+    ini.write_text(
+        "[env:uno]\nplatform = atmelavr\nboard = uno\nframework = arduino\n",
+        encoding="utf-8",
+    )
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.cpp").write_text("#include <Arduino.h>\nvoid setup(){}\nvoid loop(){}\n", encoding="utf-8")
+
+    manager._preflight_before_build_upload = lambda *a, **k: (False, ["preflight failed"], "preflight failed")
+    result = manager.build_sketch(str(tmp_path), env="uno")
+
+    assert result["ok"] is False
+    assert "preflight failed" in result["error"].lower()

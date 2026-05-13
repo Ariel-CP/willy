@@ -4,7 +4,10 @@ Clicking a file sends its path to the chat panel.
 """
 
 import os
+import shutil
 import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
 import customtkinter as ctk
 from typing import Callable
 from app import i18n
@@ -33,7 +36,7 @@ class FileBrowser(ctk.CTkFrame):
 
         ctk.CTkLabel(
             header,
-                text=i18n.get("files_header"),
+            text=i18n.get("files_header"),
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=("gray30", "gray80"),
         ).grid(row=0, column=0, padx=8, pady=6, sticky="w")
@@ -71,34 +74,28 @@ class FileBrowser(ctk.CTkFrame):
         )
         self.path_label.grid(row=1, column=0, padx=8, pady=(2, 0), sticky="ew")
 
-        # Tree frame (using plain tk.Listbox for simplicity and speed)
+        # Tree frame
         tree_outer = ctk.CTkFrame(self, fg_color=("gray94", "#0d1117"))
         tree_outer.grid(row=2, column=0, sticky="nsew", padx=0, pady=0)
         tree_outer.grid_rowconfigure(0, weight=1)
         tree_outer.grid_columnconfigure(0, weight=1)
 
-        self.listbox = tk.Listbox(
-            tree_outer,
-            selectmode="single",
-            font=("monospace", 11),
-            bg="#0d1117",
-            fg="#d0d0d0",
-            selectbackground="#264f78",
-            selectforeground="white",
-            relief="flat",
-            bd=0,
-            activestyle="none",
-            highlightthickness=0,
-        )
-        self.listbox.grid(row=0, column=0, sticky="nsew")
-        self.listbox.bind("<Double-Button-1>", self._on_double_click)
-        self.listbox.bind("<Return>", self._on_double_click)
+        self.tree = tk.ttk.Treeview(tree_outer, selectmode="browse")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.bind("<<TreeviewOpen>>", self._on_tree_open)
+        self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<Return>", self._on_double_click)
+        self.tree.bind("<Button-3>", self._on_right_click)
 
-        sb = ctk.CTkScrollbar(tree_outer, command=self.listbox.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        self.listbox.configure(yscrollcommand=sb.set)
+        y_scroll = tk.Scrollbar(tree_outer, orient="vertical", command=self.tree.yview)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll = tk.Scrollbar(tree_outer, orient="horizontal", command=self.tree.xview)
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
 
-        self._entries: list[str] = []  # full paths parallel to listbox items
+        self._menu = tk.Menu(self, tearoff=0)
+        self._menu.add_command(label="Crear carpeta", command=self._create_folder)
+        self._menu.add_command(label="Mover", command=self._move_selected)
 
     # ------------------------------------------------------------------
     # Navigation
@@ -107,20 +104,27 @@ class FileBrowser(ctk.CTkFrame):
     def _populate(self, path: str) -> None:
         self._root_path = path
         self.path_label.configure(text=path)
-        self.listbox.delete(0, "end")
-        self._entries = []
+        self.tree.delete(*self.tree.get_children())
+        root_id = self.tree.insert("", "end", text=path, values=(path,), open=True)
+        self._populate_children(root_id, path)
 
+    def _populate_children(self, node_id: str, path: str) -> None:
+        self.tree.delete(*self.tree.get_children(node_id))
         try:
-            raw = sorted(os.listdir(path), key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower()))
-        except PermissionError:
-            self.listbox.insert("end", "[Permission denied]")
+            names = sorted(
+                os.listdir(path),
+                key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower()),
+            )
+        except (PermissionError, FileNotFoundError):
             return
 
-        for name in raw:
+        for name in names:
             full = os.path.join(path, name)
-            icon = "📁 " if os.path.isdir(full) else "📄 "
-            self.listbox.insert("end", f"{icon}{name}")
-            self._entries.append(full)
+            icon = "[DIR]" if os.path.isdir(full) else "[FILE]"
+            child_id = self.tree.insert(node_id, "end", text=f"{icon} {name}", values=(full,))
+            if os.path.isdir(full):
+                # Placeholder for lazy loading
+                self.tree.insert(child_id, "end", text="...")
 
     def _go_up(self) -> None:
         parent = os.path.dirname(self._root_path)
@@ -136,12 +140,82 @@ class FileBrowser(ctk.CTkFrame):
     # Events
     # ------------------------------------------------------------------
 
-    def _on_double_click(self, _event=None) -> None:
-        idx = self.listbox.curselection()
-        if not idx:
+    def _on_tree_open(self, _event=None) -> None:
+        selected = self.tree.selection()
+        if not selected:
             return
-        full_path = self._entries[idx[0]]
+        node_id = selected[0]
+        values = self.tree.item(node_id, "values")
+        if not values:
+            return
+        full_path = values[0]
+        if os.path.isdir(full_path):
+            self._populate_children(node_id, full_path)
+
+    def _on_double_click(self, _event=None) -> None:
+        selected_item = self.tree.selection()
+        if not selected_item:
+            return
+        values = self.tree.item(selected_item[0], "values")
+        if not values:
+            return
+        full_path = values[0]
         if os.path.isdir(full_path):
             self._populate(full_path)
         else:
             self._on_file_selected(full_path)
+
+    def _on_right_click(self, event) -> None:
+        row = self.tree.identify_row(event.y)
+        if row:
+            self.tree.selection_set(row)
+        self._menu.post(event.x_root, event.y_root)
+
+    def _selected_path(self) -> str | None:
+        selected = self.tree.selection()
+        if not selected:
+            return None
+        values = self.tree.item(selected[0], "values")
+        return values[0] if values else None
+
+    def _create_folder(self) -> None:
+        base = self._selected_path() or self._root_path
+        if os.path.isfile(base):
+            base = os.path.dirname(base)
+
+        name = simpledialog.askstring("Crear carpeta", "Nombre de la carpeta:", parent=self)
+        if not name:
+            return
+
+        target = os.path.join(base, name)
+        try:
+            os.makedirs(target, exist_ok=False)
+            self._populate(self._root_path)
+        except FileExistsError:
+            messagebox.showerror("Error", "Ya existe una carpeta o archivo con ese nombre.")
+        except OSError as exc:
+            messagebox.showerror("Error", f"No se pudo crear la carpeta: {exc}")
+
+    def _move_selected(self) -> None:
+        source = self._selected_path()
+        if not source:
+            messagebox.showinfo("Mover", "Selecciona un archivo o carpeta para mover.")
+            return
+
+        destination_dir = filedialog.askdirectory(initialdir=self._root_path, title="Mover a carpeta...")
+        if not destination_dir:
+            return
+
+        destination = os.path.join(destination_dir, os.path.basename(source))
+        if os.path.abspath(destination) == os.path.abspath(source):
+            return
+
+        if os.path.exists(destination):
+            messagebox.showerror("Error", "Ya existe un elemento con ese nombre en el destino.")
+            return
+
+        try:
+            shutil.move(source, destination)
+            self._populate(self._root_path)
+        except OSError as exc:
+            messagebox.showerror("Error", f"No se pudo mover el elemento: {exc}")
