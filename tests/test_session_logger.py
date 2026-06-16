@@ -21,3 +21,25 @@ def test_session_logger_writes_diagnostics_file(tmp_path: Path) -> None:
 
     assert "system_event" in event_types
     assert "system_error" in event_types
+
+
+def test_session_logger_redacts_secrets_in_message_and_command(tmp_path: Path) -> None:
+    session_logger_module.SESSIONS_DIR = str(tmp_path)
+
+    logger = SessionLogger()
+    logger.log_message("user", "mi key es sk-proj-1234567890abcdef1234567890abcdef")
+    logger.log_command(
+        "export OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456",
+        "Authorization: Bearer top-secret-token-value",
+    )
+
+    data = json.loads(Path(logger.path).read_text(encoding="utf-8"))
+    events = data.get("events", [])
+
+    msg_event = next(e for e in events if e.get("type") == "message")
+    cmd_event = next(e for e in events if e.get("type") == "command")
+
+    assert "sk-proj-" not in msg_event.get("text", "")
+    assert "[REDACTED_API_KEY]" in msg_event.get("text", "")
+    assert "top-secret-token-value" not in cmd_event.get("output", "")
+    assert "[REDACTED_TOKEN]" in cmd_event.get("output", "")

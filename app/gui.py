@@ -26,6 +26,7 @@ from app.terminal_panel import TerminalPanel
 from app.chat_panel import ChatPanel
 from app.file_browser import FileBrowser
 from app.ai_agent import AIAgent
+from app.environment_memory import EnvironmentMemory
 from app.session_logger import SessionLogger
 from app.tts import TTSEngine
 from app.arduino_manager import ArduinoManager
@@ -94,6 +95,7 @@ class WillyApp(ctk.CTk):
 
         self._build_layout()
         self._wire_up()
+        self._refresh_environment_memory()
         self.after(50, self._process_tts_visual_events)
         self.after(200, self._show_startup_greeting)
         self.after(800, self._trigger_device_scan)
@@ -123,6 +125,9 @@ class WillyApp(ctk.CTk):
             output_callback=self._on_terminal_output,
             initial_dir=initial_dir,
             on_command_done=self.session_logger.log_command,
+        )
+        self.environment_memory = EnvironmentMemory(
+            base_dir=os.path.dirname(os.path.dirname(__file__)),
         )
 
         # Initialize ArduinoManager for microcontroller operations
@@ -542,6 +547,7 @@ class WillyApp(ctk.CTk):
             arduino_manager=self.arduino_manager,
             on_file_written=self._on_ai_file_written,
             on_schematic_generated=self._on_schematic_generated,
+            environment_context_provider=self._environment_context_for_agent,
         )
 
         def _logged_send(text: str) -> None:
@@ -649,6 +655,39 @@ class WillyApp(ctk.CTk):
                 component="status",
                 data={"text": text},
             )
+
+    def _environment_preferences(self) -> dict:
+        return {
+            "language": self.config_data.get("language", "es"),
+            "theme": self.config_data.get("theme", "dark"),
+            "model": self.config_data.get("model", "gpt-4o"),
+            "initial_directory": self.config_data.get("initial_directory", "~"),
+        }
+
+    def _refresh_environment_memory(self) -> None:
+        try:
+            snapshot, changed = self.environment_memory.refresh(
+                preferences=self._environment_preferences(),
+                microcontrollers=list(self._detected_devices),
+            )
+            if changed:
+                self.session_logger.log_event(
+                    "environment_context_updated",
+                    component="environment_memory",
+                    data={
+                        "hostname": snapshot.get("system", {}).get("hostname", "unknown"),
+                        "microcontrollers": len(snapshot.get("embedded", {}).get("microcontrollers", [])),
+                    },
+                )
+        except Exception as exc:
+            self._on_system_error(str(exc), component="environment_memory")
+
+    def _environment_context_for_agent(self) -> str:
+        try:
+            self._refresh_environment_memory()
+            return self.environment_memory.summary_for_prompt()
+        except Exception:
+            return ""
 
     def _on_progress(self, percent: float, detail: str = "") -> None:
         """Update bottom progress bar with completion percentage."""
@@ -987,6 +1026,7 @@ class WillyApp(ctk.CTk):
             self._set_device_indicator(False)
             self.device_status_label.configure(text="Dispositivo: no disponible")
             self.device_detail_label.configure(text=f"Error: {error[:110]}")
+            self._refresh_environment_memory()
             self._schedule_next_device_poll()
             return
 
@@ -996,6 +1036,7 @@ class WillyApp(ctk.CTk):
             self._set_device_indicator(False)
             self.device_status_label.configure(text="Dispositivo: no conectado")
             self.device_detail_label.configure(text="No se detectaron dispositivos")
+            self._refresh_environment_memory()
             self._schedule_next_device_poll()
             return
 
@@ -1007,6 +1048,7 @@ class WillyApp(ctk.CTk):
         self._set_device_indicator(True)
         self.device_status_label.configure(text=f"Conectado: {board} en {port}")
         self.device_detail_label.configure(text=f"Dispositivos detectados: {len(devices)}")
+        self._refresh_environment_memory()
         self._schedule_next_device_poll()
 
     def _refresh_device_picker(self) -> None:
@@ -1582,6 +1624,26 @@ class WillyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             anchor="w"
         ).pack(anchor="w", padx=12, pady=(10, 2))
+
+        api_source = tk.StringVar(value=_resolve_api_source(self.config_data))
+        api_source_row = ctk.CTkFrame(api_card, fg_color="transparent")
+        api_source_row.pack(anchor="w", fill="x", padx=12, pady=(0, 6))
+        ctk.CTkLabel(
+            api_source_row,
+            text=i18n.get("settings_api_source"),
+            font=ctk.CTkFont(size=10),
+            text_color=("gray45", "gray65"),
+            anchor="w",
+        ).pack(side="left", padx=(0, 8))
+
+        api_source_selector = ctk.CTkOptionMenu(
+            api_source_row,
+            values=["env", "config"],
+            variable=api_source,
+            width=200,
+        )
+        api_source_selector.pack(side="left")
+
         api_key_var = tk.StringVar(value=self.config_data.get("openai_api_key", ""))
         api_key_visible = tk.BooleanVar(value=False)
 
@@ -1612,13 +1674,48 @@ class WillyApp(ctk.CTk):
         )
         toggle_btn.pack(side="left")
 
-        ctk.CTkLabel(
+        api_hint_var = tk.StringVar(value="")
+        api_hint_label = ctk.CTkLabel(
             api_card,
-            text="Tip: mantenla oculta al compartir pantalla.",
+            textvariable=api_hint_var,
             font=ctk.CTkFont(size=10),
             text_color=("gray45", "gray65"),
             anchor="w",
-        ).pack(anchor="w", padx=12, pady=(0, 10))
+        )
+        api_hint_label.pack(anchor="w", padx=12, pady=(0, 10))
+
+        def refresh_api_hint(*_args) -> None:
+            source = api_source.get()
+            env_value = os.getenv("OPENAI_API_KEY", "").strip()
+            env_status = (
+                i18n.get("api_status_ok")
+                if _is_configured_api_key(env_value)
+                else i18n.get("api_status_missing")
+            )
+
+            if source == "env":
+                api_hint_var.set(
+                    i18n.get(
+                        "settings_api_hint_env",
+                        env_name="OPENAI_API_KEY",
+                        status=env_status,
+                    )
+                )
+                api_key_entry.configure(state="disabled")
+                toggle_btn.configure(state="disabled")
+            else:
+                local_status = (
+                    i18n.get("api_status_ok")
+                    if _is_configured_api_key(api_key_var.get().strip())
+                    else i18n.get("api_status_missing")
+                )
+                api_hint_var.set(i18n.get("settings_api_hint_config", status=local_status))
+                api_key_entry.configure(state="normal")
+                toggle_btn.configure(state="normal")
+
+        api_source.trace_add("write", refresh_api_hint)
+        api_key_var.trace_add("write", refresh_api_hint)
+        refresh_api_hint()
 
         # Default folder
         folder_card = ctk.CTkFrame(body, corner_radius=12, fg_color=("gray93", "gray17"))
@@ -1696,7 +1793,11 @@ class WillyApp(ctk.CTk):
                 feedback_var.set("No tienes permisos de escritura en la carpeta.")
                 return
             # Guardar config
-            self.config_data["openai_api_key"] = api_key_var.get()
+            selected_source = api_source.get() if api_source.get() in {"env", "config"} else "env"
+            self.config_data["api_key_source"] = selected_source
+            self.config_data["openai_api_key"] = (
+                api_key_var.get().strip() if selected_source == "config" else ""
+            )
             self.config_data["initial_directory"] = folder
             with open(CONFIG_PATH, "w", encoding="utf-8") as config_file:
                 json.dump(self.config_data, config_file, indent=4)

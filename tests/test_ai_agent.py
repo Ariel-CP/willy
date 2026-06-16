@@ -111,3 +111,28 @@ def test_resolve_project_env_falls_back_to_project_default() -> None:
 
     assert env == "esp32dev"
     assert "project default" in note.lower()
+
+
+def test_build_request_messages_includes_dynamic_environment_context() -> None:
+    agent = AIAgent(
+        config={"default_board": "esp32"},
+        terminal_manager=DummyTM(),
+        on_message=lambda _r, _t: None,
+        on_confirm_request=lambda _title, _detail, callback: callback(True),
+        on_status=lambda _s: None,
+        arduino_manager=DummyArduinoManager(),
+        environment_context_provider=lambda: "ENVIRONMENT_CONTEXT\nos=Linux",
+    )
+
+    messages = agent._build_request_messages()
+
+    assert len(messages) >= 2
+    assert messages[-1]["role"] == "system"
+    assert "ENVIRONMENT_CONTEXT" in messages[-1]["content"]
+
+
+def test_ssh_command_always_requires_confirmation() -> None:
+    agent = _agent()
+
+    assert agent._needs_confirmation("ssh pi@raspberrypi.local 'uname -a'") is True
+    assert agent._needs_confirmation("scp main.py pi@raspberrypi.local:/home/pi/") is True

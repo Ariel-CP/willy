@@ -16,6 +16,7 @@ from typing import Callable, Optional
 import openai
 from app import i18n
 from app.iot_diagram_manager import IoTDiagramManager
+from app.security_utils import redact_sensitive_text
 
 # ---------------------------------------------------------------------------
 # Tool schemas
@@ -353,7 +354,9 @@ Guidelines:
 - When asked about microcontrollers (Arduino, ESP32, etc.), prefer using IoT tools (detect, build, upload).
 - When asked to design a circuit, wiring, or component diagram, use generate_iot_schematic.
 - For terminal commands, use run_command. For file operations, use read_file/write_file.
+- SSH is allowed for Raspberry/system administration tasks. Prefer safe patterns like `ssh user@host 'command'` and explain what will run.
 - For commands that could be destructive (rm, sudo, overwriting files, etc.), briefly explain what you are about to do before the tool call. The UI will ask the user for confirmation.
+- SSH/SCP/RSYNC remote commands must always request confirmation before execution.
 - For read-only operations (ls, cat, pwd, search_web, fetch_webpage, detect_microcontroller, etc.) you can proceed directly.
 - Always show relevant command or tool output to the user in your response.
 - When using web data, include source URLs in your final answer.
@@ -434,6 +437,7 @@ class AIAgent:
         arduino_manager=None,
         on_file_written: Optional[Callable[[str, str], None]] = None,
         on_schematic_generated: Optional[Callable[[str, str], None]] = None,
+        environment_context_provider: Optional[Callable[[], str]] = None,
     ):
         """
         Parameters
@@ -454,6 +458,7 @@ class AIAgent:
         self.arduino_manager = arduino_manager
         self.on_file_written = on_file_written
         self.on_schematic_generated = on_schematic_generated
+        self.environment_context_provider = environment_context_provider
         self.diagram_manager = IoTDiagramManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
         self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         self._client: Optional[openai.OpenAI] = None
@@ -493,6 +498,29 @@ class AIAgent:
 
     def clear_history(self) -> None:
         self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    def _build_request_messages(self) -> list[dict]:
+        """Build request messages with optional dynamic environment context."""
+        messages = list(self.history)
+        if not callable(self.environment_context_provider):
+            return messages
+
+        try:
+            context = (self.environment_context_provider() or "").strip()
+        except Exception:
+            context = ""
+
+        if context:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Use this live environment context to make practical decisions "
+                        "for Linux/system/electronics workflows:\n" + context
+                    ),
+                }
+            )
+        return messages
 
     # ------------------------------------------------------------------
     # Core loop
@@ -613,7 +641,7 @@ class AIAgent:
                 try:
                     response = client.chat.completions.create(
                         model=model,
-                        messages=self.history,
+                        messages=self._build_request_messages(),
                         tools=TOOLS,
                         tool_choice="auto",
                     )
@@ -772,8 +800,15 @@ class AIAgent:
         
         if self.config.get("confirm_readonly", False):
             return True
+
+        lowered = command.strip().lower()
+        first_token = lowered.split()[0] if lowered else ""
+
+        # SSH-like remote operations always require explicit approval.
+        if first_token in {"ssh", "scp", "sftp", "rsync"}:
+            return True
+
         always = self.config.get("always_confirm", [])
-        first_token = command.strip().split()[0] if command.strip() else ""
         return first_token in always
 
     def _tool_run_command(self, args: dict) -> str:
@@ -1404,7 +1439,10 @@ class AIAgent:
                 {
                     "timestamp": stamp,
                     "event": event_type,
-                    "payload": payload,
+                    "payload": {
+                        k: redact_sensitive_text(str(v), max_chars=20_000)
+                        for k, v in (payload or {}).items()
+                    },
                 },
                 ensure_ascii=False,
             )

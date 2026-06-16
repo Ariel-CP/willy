@@ -9,6 +9,8 @@ import threading
 import traceback
 from datetime import datetime
 
+from app.security_utils import redact_sensitive_text
+
 SESSIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sessions")
 
 
@@ -31,11 +33,23 @@ class SessionLogger:
 
     def log_message(self, role: str, text: str) -> None:
         """Log a chat message (user, assistant, system, error)."""
-        self._append({"type": "message", "role": role, "text": text})
+        self._append(
+            {
+                "type": "message",
+                "role": role,
+                "text": redact_sensitive_text(text, max_chars=30_000),
+            }
+        )
 
     def log_command(self, command: str, output: str) -> None:
         """Log a terminal command and its full output."""
-        self._append({"type": "command", "command": command, "output": output})
+        self._append(
+            {
+                "type": "command",
+                "command": redact_sensitive_text(command, max_chars=4_000),
+                "output": redact_sensitive_text(output, max_chars=80_000),
+            }
+        )
 
     def log_event(
         self,
@@ -73,17 +87,17 @@ class SessionLogger:
             "type": "system_error",
             "level": "error",
             "component": component,
-            "message": message,
+            "message": redact_sensitive_text(message, max_chars=30_000),
             "context": context or {},
-            "traceback": tb,
+            "traceback": redact_sensitive_text(tb, max_chars=80_000),
         }
         self._append(payload)
 
-        diag_message = message
+        diag_message = redact_sensitive_text(message, max_chars=30_000)
         if context:
-            diag_message += f" | context={context}"
+            diag_message += f" | context={redact_sensitive_text(str(context), max_chars=8_000)}"
         if tb:
-            diag_message += f"\n{tb.strip()}"
+            diag_message += f"\n{redact_sensitive_text(tb.strip(), max_chars=80_000)}"
         self._append_diag_line("ERROR", component, diag_message)
 
     @property
@@ -117,7 +131,7 @@ class SessionLogger:
 
     def _append_diag_line(self, level: str, component: str, message: str) -> None:
         stamp = datetime.now().isoformat(timespec="seconds")
-        line = f"[{stamp}] {level} [{component}] {message}\n"
+        line = f"[{stamp}] {level} [{component}] {redact_sensitive_text(message, max_chars=80_000)}\n"
         try:
             with open(self._diag_path, "a", encoding="utf-8") as fh:
                 fh.write(line)
