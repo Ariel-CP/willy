@@ -6,6 +6,7 @@ Layout:  [FileBrowser (sidebar)] | [ChatPanel] | [TerminalPanel]
 import json
 import os
 import platform
+import shutil
 import socket
 import queue
 import threading
@@ -92,6 +93,11 @@ class WillyApp(ctk.CTk):
         self._code_expand_window = None
         self._code_expand_text = None
         self._iot_action_running = False
+        self._flowchart_running = False
+        self._last_ai_usage_status = ""
+        self._layout_reflow_job = None
+        self._last_layout_signature = None
+        self._startup_diag_running = False
 
         self._build_layout()
         self._wire_up()
@@ -99,10 +105,12 @@ class WillyApp(ctk.CTk):
         self.after(50, self._process_tts_visual_events)
         self.after(200, self._show_startup_greeting)
         self.after(800, self._trigger_device_scan)
+        self.after(1600, self._trigger_startup_diagnostics)
         self.after(1200, self._refresh_latest_schematic)
 
         self.bind("<Control-comma>", lambda _e: self._open_settings())
         self.bind("<Control-b>", lambda _e: self._toggle_sidebar())
+        self.bind("<Configure>", self._on_window_configure)
         self._sidebar_visible = True
 
     # ------------------------------------------------------------------
@@ -189,11 +197,21 @@ class WillyApp(ctk.CTk):
         )
         self.terminal_panel.grid(row=0, column=0, sticky="nsew")
 
-        self.after(150, lambda: self.right_splitter.sash_place(0, 1, 360))
+        self.after(150, self._apply_adaptive_layout)
 
         status_bar = ctk.CTkFrame(self, height=22, fg_color=("gray80", "gray18"))
         status_bar.grid(row=1, column=0, columnspan=3, sticky="ew")
-        status_bar.grid_columnconfigure(0, weight=1)
+        status_bar.grid_columnconfigure(1, weight=1)
+
+        self.ai_icon_label = ctk.CTkLabel(
+            status_bar,
+            text="🤖",
+            width=18,
+            font=ctk.CTkFont(size=11),
+            text_color=("gray35", "#93c5fd"),
+            anchor="w",
+        )
+        self.ai_icon_label.grid(row=0, column=0, sticky="w", padx=(6, 0), pady=2)
 
         self.status_bar_label = ctk.CTkLabel(
             status_bar,
@@ -202,7 +220,7 @@ class WillyApp(ctk.CTk):
             text_color=("gray40", "gray60"),
             anchor="w",
         )
-        self.status_bar_label.grid(row=0, column=0, sticky="ew", padx=4)
+        self.status_bar_label.grid(row=0, column=1, sticky="ew", padx=(4, 4))
 
         self.progress_bar = ctk.CTkProgressBar(
             status_bar,
@@ -212,7 +230,7 @@ class WillyApp(ctk.CTk):
             progress_color="#64748b",
         )
         self.progress_bar.set(0)
-        self.progress_bar.grid(row=0, column=1, padx=(0, 6), pady=4)
+        self.progress_bar.grid(row=0, column=2, padx=(0, 6), pady=4)
 
         self.progress_percent_label = ctk.CTkLabel(
             status_bar,
@@ -222,7 +240,7 @@ class WillyApp(ctk.CTk):
             width=42,
             anchor="e",
         )
-        self.progress_percent_label.grid(row=0, column=2, padx=(0, 8), pady=2, sticky="e")
+        self.progress_percent_label.grid(row=0, column=3, padx=(0, 8), pady=2, sticky="e")
         self._progress_state = "idle"
         self._progress_current = 0.0
         self._progress_target = 0.0
@@ -237,7 +255,7 @@ class WillyApp(ctk.CTk):
             fg_color="transparent",
             hover_color=("gray70", "gray30"),
             command=self._open_settings,
-        ).grid(row=0, column=3, padx=(0, 4))
+        ).grid(row=0, column=4, padx=(0, 4))
 
     def _build_iot_dashboard(self, parent) -> None:
         dashboard = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
@@ -300,6 +318,16 @@ class WillyApp(ctk.CTk):
             justify="left",
         )
         self.device_detail_label.grid(row=1, column=1, sticky="w")
+
+        self.toolchain_status_label = ctk.CTkLabel(
+            status_row,
+            text="Toolchain: verificando entorno...",
+            font=ctk.CTkFont(size=9),
+            text_color=("gray45", "gray65"),
+            anchor="w",
+            justify="left",
+        )
+        self.toolchain_status_label.grid(row=2, column=1, sticky="w", pady=(1, 0))
 
         device_row = ctk.CTkFrame(dashboard, fg_color="transparent")
         device_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 4))
@@ -427,6 +455,18 @@ class WillyApp(ctk.CTk):
         )
         self.diagram_refresh_btn.grid(row=0, column=1, sticky="e", padx=(6, 4))
 
+        self.diagram_flow_btn = ctk.CTkButton(
+            diagram_row,
+            text="Flujo",
+            width=64,
+            height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="#0ea5a4",
+            hover_color="#0f766e",
+            command=self._start_flowchart_generation,
+        )
+        self.diagram_flow_btn.grid(row=0, column=2, sticky="e", padx=(0, 4))
+
         self.diagram_open_btn = ctk.CTkButton(
             diagram_row,
             text="Abrir",
@@ -438,7 +478,7 @@ class WillyApp(ctk.CTk):
             command=self._open_latest_schematic,
             state="disabled",
         )
-        self.diagram_open_btn.grid(row=0, column=2, sticky="e")
+        self.diagram_open_btn.grid(row=0, column=3, sticky="e")
 
         ctk.CTkLabel(
             dashboard,
@@ -536,6 +576,84 @@ class WillyApp(ctk.CTk):
     # Wiring
     # ------------------------------------------------------------------
 
+    def _on_window_configure(self, event) -> None:
+        # Debounce frequent configure events while the user is resizing.
+        if event.widget is not self:
+            return
+        self._schedule_adaptive_layout()
+
+    def _schedule_adaptive_layout(self) -> None:
+        if self._layout_reflow_job is not None:
+            self.after_cancel(self._layout_reflow_job)
+        self._layout_reflow_job = self.after(120, self._apply_adaptive_layout)
+
+    def _apply_adaptive_layout(self) -> None:
+        self._layout_reflow_job = None
+
+        try:
+            self.update_idletasks()
+        except Exception:
+            return
+
+        window_w = max(1, self.winfo_width())
+        right_w = max(1, self.right_panel.winfo_width())
+        right_h = max(1, self.right_panel.winfo_height())
+
+        if right_h < 120:
+            return
+
+        if right_h >= 840:
+            split_ratio = 0.60
+        elif right_h >= 740:
+            split_ratio = 0.57
+        elif right_h >= 650:
+            split_ratio = 0.54
+        else:
+            split_ratio = 0.50
+
+        if right_w < 430:
+            split_ratio -= 0.05
+        if window_w < 1180:
+            split_ratio -= 0.03
+
+        split_ratio = max(0.44, min(0.64, split_ratio))
+
+        min_top = 240 if right_h >= 640 else 210
+        min_bottom = 150 if right_h >= 640 else 130
+        target_top_h = int(right_h * split_ratio)
+        target_top_h = max(min_top, min(target_top_h, right_h - min_bottom))
+
+        if right_h < 650:
+            preview_height = 4
+            code_height = 110
+        elif right_h < 780:
+            preview_height = 5
+            code_height = 130
+        else:
+            preview_height = 6
+            code_height = 150
+
+        signature = (target_top_h, preview_height, code_height)
+        if signature == self._last_layout_signature:
+            return
+
+        self._last_layout_signature = signature
+
+        try:
+            self.right_splitter.sash_place(0, 1, target_top_h)
+        except Exception:
+            pass
+
+        try:
+            self.diagram_preview.configure(height=preview_height)
+        except Exception:
+            pass
+
+        try:
+            self.code_preview.configure(height=code_height)
+        except Exception:
+            pass
+
     def _wire_up(self) -> None:
         self.ai_agent = AIAgent(
             config=self.config_data,
@@ -547,7 +665,9 @@ class WillyApp(ctk.CTk):
             arduino_manager=self.arduino_manager,
             on_file_written=self._on_ai_file_written,
             on_schematic_generated=self._on_schematic_generated,
+            on_flowchart_generated=self._on_flowchart_generated,
             environment_context_provider=self._environment_context_for_agent,
+            on_usage_update=self._on_ai_usage_update,
         )
 
         def _logged_send(text: str) -> None:
@@ -643,9 +763,10 @@ class WillyApp(ctk.CTk):
             self.clippy.blink()
 
     def _on_status(self, text: str) -> None:
-        self.chat_panel.set_status(text)
+        display_text = text or self._last_ai_usage_status or i18n.get('ready')
+        self.chat_panel.set_status(display_text)
         self.after(0, self.status_bar_label.configure, {
-            "text": f"  {text}" if text else f"  {i18n.get('ready')}"
+            "text": f"  {display_text}"
         })
         lowered = (text or "").lower()
         if any(token in lowered for token in ("error", "failed", "fallo", "exception")):
@@ -655,6 +776,96 @@ class WillyApp(ctk.CTk):
                 component="status",
                 data={"text": text},
             )
+
+    def _trigger_startup_diagnostics(self) -> None:
+        if self._startup_diag_running:
+            return
+        self._startup_diag_running = True
+        threading.Thread(target=self._run_startup_diagnostics_async, daemon=True).start()
+
+    def _run_startup_diagnostics_async(self) -> None:
+        results = {
+            "platformio": bool(getattr(self.arduino_manager, "platformio_path", "")),
+            "pyserial": self._module_available("serial"),
+            "cairosvg": self._module_available("cairosvg"),
+            "graphviz": bool(shutil.which("dot")),
+            "mmdc": bool(self._resolve_mmdc_bin_for_diagnostics()),
+        }
+
+        badges = [
+            f"PIO {'OK' if results['platformio'] else 'MISSING'}",
+            f"SERIAL {'OK' if results['pyserial'] else 'MISSING'}",
+            f"MMDC {'OK' if results['mmdc'] else 'MISSING'}",
+            f"DOT {'OK' if results['graphviz'] else 'MISSING'}",
+            f"SVG {'OK' if results['cairosvg'] else 'MISSING'}",
+        ]
+        status_text = "Toolchain: " + " | ".join(badges)
+
+        critical_missing = not results["platformio"] or not results["pyserial"]
+        all_ready = all(results.values())
+        if critical_missing:
+            color = "#ef4444"
+        elif all_ready:
+            color = "#22c55e"
+        else:
+            color = "#f59e0b"
+
+        def _apply_diag_ui() -> None:
+            self._startup_diag_running = False
+            if hasattr(self, "toolchain_status_label"):
+                self.toolchain_status_label.configure(text=status_text, text_color=color)
+
+        self.after(0, _apply_diag_ui)
+        self.session_logger.log_event(
+            "startup_diagnostics",
+            component="system",
+            data={
+                "status_text": status_text,
+                **results,
+            },
+        )
+
+    @staticmethod
+    def _module_available(module_name: str) -> bool:
+        try:
+            __import__(module_name)
+            return True
+        except Exception:
+            return False
+
+    def _resolve_mmdc_bin_for_diagnostics(self) -> str:
+        direct = shutil.which("mmdc")
+        if direct:
+            return direct
+        candidates = [
+            os.path.expanduser("~/.local/node_modules/.bin/mmdc"),
+            os.path.expanduser("~/.npm-global/bin/mmdc"),
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "node_modules", ".bin", "mmdc"),
+        ]
+        for cand in candidates:
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+        return ""
+
+    def _on_ai_usage_update(self, usage_payload: dict) -> None:
+        status_text = str(usage_payload.get("status_text", "")).strip()
+        if status_text:
+            self._last_ai_usage_status = status_text
+
+        self.session_logger.log_event(
+            "ai_usage",
+            component="ai_agent",
+            data={
+                "model": usage_payload.get("model"),
+                "prompt_tokens": usage_payload.get("prompt_tokens", 0),
+                "completion_tokens": usage_payload.get("completion_tokens", 0),
+                "total_tokens": usage_payload.get("total_tokens", 0),
+                "session_total_tokens": usage_payload.get("session_total_tokens", 0),
+                "session_remaining_tokens": usage_payload.get("session_remaining_tokens", 0),
+                "session_credit_percent": usage_payload.get("session_credit_percent", 0),
+                "session_budget_tokens": usage_payload.get("session_budget_tokens", 0),
+            },
+        )
 
     def _environment_preferences(self) -> dict:
         return {
@@ -779,6 +990,10 @@ class WillyApp(ctk.CTk):
         # Called from agent worker thread; marshal to UI thread.
         self.after(0, self._apply_generated_schematic, svg_path, bom_path)
 
+    def _on_flowchart_generated(self, diagram_path: str, mmd_path: str) -> None:
+        # Called from agent worker thread; marshal to UI thread.
+        self.after(0, self._apply_generated_flowchart, diagram_path, mmd_path)
+
     def _apply_generated_schematic(self, svg_path: str, bom_path: str) -> None:
         self._latest_schematic_path = svg_path or ""
         self._latest_bom_path = bom_path or ""
@@ -792,6 +1007,64 @@ class WillyApp(ctk.CTk):
                 self.diagram_open_btn.configure(state="disabled")
 
         self._update_schematic_preview(svg_path)
+
+    def _start_flowchart_generation(self) -> None:
+        if self._flowchart_running:
+            return
+
+        project_path = self._resolve_project_path_for_actions()
+        project_title = os.path.basename(project_path.rstrip(os.sep)) or "project_flow"
+
+        self._flowchart_running = True
+        if hasattr(self, "diagram_flow_btn"):
+            self.diagram_flow_btn.configure(state="disabled", text="Generando...")
+
+        self.session_logger.log_event(
+            "flowchart_generation_started",
+            component="iot",
+            data={"project_path": project_path, "title": project_title},
+        )
+        self._on_status(f"Generando flujo de {project_title}...")
+        self.ai_agent.generate_flowchart_for_project(project_path=project_path, title=project_title)
+
+    def _apply_generated_flowchart(self, diagram_path: str, mmd_path: str) -> None:
+        self._flowchart_running = False
+        if hasattr(self, "diagram_flow_btn"):
+            self.diagram_flow_btn.configure(state="normal", text="Flujo")
+
+        if not diagram_path and not mmd_path:
+            self.session_logger.log_event("flowchart_generation_failed", component="iot")
+            return
+
+        selected_path = diagram_path if (diagram_path and os.path.isfile(diagram_path)) else mmd_path
+        self._latest_schematic_path = selected_path or ""
+
+        if hasattr(self, "diagram_status_label"):
+            if selected_path and os.path.isfile(selected_path):
+                self.diagram_status_label.configure(text=f"Flujo: {os.path.basename(selected_path)}")
+                self.diagram_open_btn.configure(state="normal")
+            else:
+                self.diagram_status_label.configure(text="Flujo: generado sin archivo visible")
+
+        if selected_path and selected_path.lower().endswith((".svg", ".png")):
+            self._update_schematic_preview(selected_path)
+        else:
+            self._update_schematic_preview("")
+
+        self.session_logger.log_event(
+            "flowchart_saved_path",
+            component="iot",
+            data={
+                "diagram_path": diagram_path,
+                "mmd_path": mmd_path,
+            },
+        )
+
+        try:
+            if selected_path and os.path.isfile(selected_path):
+                webbrowser.open(f"file://{selected_path}")
+        except Exception:
+            pass
 
     def _on_ai_file_written(self, path: str, content: str) -> None:
         # Called from agent worker thread; marshal to UI thread.
@@ -1579,7 +1852,8 @@ class WillyApp(ctk.CTk):
         """Open the improved settings dialog with validation and sync."""
         settings_window = ctk.CTkToplevel(self)
         settings_window.title(i18n.get("settings_title"))
-        settings_window.geometry("560x460")
+        settings_window.geometry("680x560")
+        settings_window.minsize(620, 520)
         settings_window.transient(self)
         settings_window.update_idletasks()
 
@@ -1590,7 +1864,7 @@ class WillyApp(ctk.CTk):
                 pass
 
         settings_window.after(0, _safe_grab_set)
-        settings_window.resizable(False, False)
+        settings_window.resizable(True, True)
 
         frame = ctk.CTkFrame(settings_window, corner_radius=14)
         frame.pack(fill="both", expand=True, padx=18, pady=18)
@@ -1649,14 +1923,14 @@ class WillyApp(ctk.CTk):
 
         api_row = ctk.CTkFrame(api_card, fg_color="transparent")
         api_row.pack(anchor="w", fill="x", padx=12, pady=(0, 8))
+        api_row.grid_columnconfigure(0, weight=1)
 
         api_key_entry = ctk.CTkEntry(
             api_row,
             textvariable=api_key_var,
-            width=390,
             show="*",
         )
-        api_key_entry.pack(side="left", padx=(0, 8))
+        api_key_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
         def toggle_api_visibility() -> None:
             visible = not api_key_visible.get()
@@ -1672,7 +1946,7 @@ class WillyApp(ctk.CTk):
             hover_color=("gray60", "gray45"),
             command=toggle_api_visibility,
         )
-        toggle_btn.pack(side="left")
+        toggle_btn.grid(row=0, column=1, sticky="e")
 
         api_hint_var = tk.StringVar(value="")
         api_hint_label = ctk.CTkLabel(
@@ -1729,12 +2003,12 @@ class WillyApp(ctk.CTk):
         folder_var = tk.StringVar(value=self.config_data.get("initial_directory", "~"))
         folder_row = ctk.CTkFrame(folder_card, fg_color="transparent")
         folder_row.pack(anchor="w", fill="x", padx=12, pady=(0, 8))
+        folder_row.grid_columnconfigure(0, weight=1)
         folder_entry = ctk.CTkEntry(
             folder_row,
             textvariable=folder_var,
-            width=390,
         )
-        folder_entry.pack(side="left", padx=(0, 8))
+        folder_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
         def select_folder():
             folder = tk.filedialog.askdirectory(initialdir=os.path.expanduser(folder_var.get()))
@@ -1748,7 +2022,7 @@ class WillyApp(ctk.CTk):
             fg_color=("gray70", "gray35"),
             hover_color=("gray60", "gray45"),
             command=select_folder,
-        ).pack(side="left")
+        ).grid(row=0, column=1, sticky="e")
 
         ctk.CTkLabel(
             folder_card,
