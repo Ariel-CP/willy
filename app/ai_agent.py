@@ -583,6 +583,8 @@ class AIAgent:
             self._client = openai.OpenAI(api_key=api_key)
         return self._client
 
+    _MAX_PLAN_STEPS = 15
+
     def _extract_plan_steps(self, text: str) -> list[str]:
         """Extract plan steps from XML tags in assistant response."""
         import re
@@ -593,7 +595,7 @@ class AIAgent:
             steps.append(content.strip())
 
         if steps:
-            return steps
+            return steps[: self._MAX_PLAN_STEPS]
 
         # Fallback for plain-text numbered plans.
         for line in text.splitlines():
@@ -601,6 +603,8 @@ class AIAgent:
             m = re.match(r"^(\d+)\.\s+(.+)$", stripped)
             if m:
                 steps.append(m.group(2).strip())
+                if len(steps) >= self._MAX_PLAN_STEPS:
+                    break
         return steps
 
     def _has_plan(self, text: str) -> bool:
@@ -827,23 +831,28 @@ class AIAgent:
 
     def _needs_confirmation(self, command: str) -> bool:
         import time
-        
-        # Skip confirmation if plan was just confirmed (within 5 minute window)
-        if self.skip_confirmations_until is not None and time.time() < self.skip_confirmations_until:
-            return False
-        
-        if self.config.get("confirm_readonly", False):
-            return True
 
         lowered = command.strip().lower()
         first_token = lowered.split()[0] if lowered else ""
 
-        # SSH-like remote operations always require explicit approval.
+        # SSH-like remote operations ALWAYS require explicit approval,
+        # even inside a confirmed plan window.
         if first_token in {"ssh", "scp", "sftp", "rsync"}:
             return True
 
+        # always_confirm list has absolute priority over plan window.
         always = self.config.get("always_confirm", [])
-        return first_token in always
+        if first_token in always:
+            return True
+
+        # Skip remaining confirmations if plan was just confirmed (5-min window).
+        if self.skip_confirmations_until is not None and time.time() < self.skip_confirmations_until:
+            return False
+
+        if self.config.get("confirm_readonly", False):
+            return True
+
+        return False
 
     def _tool_run_command(self, args: dict) -> str:
         command = args.get("command", "").strip()

@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from app.ai_agent import AIAgent
@@ -163,3 +165,50 @@ def test_get_client_falls_back_to_config_key_when_env_missing(monkeypatch: pytes
 
     assert isinstance(client, DummyClient)
     assert captured["api_key"] == "sk-config-123"
+
+
+def test_ssh_always_confirmed_even_during_plan_window() -> None:
+    """SSH/SCP must require confirmation even inside the plan skip-window."""
+    agent = _agent()
+    agent.skip_confirmations_until = time.time() + 300  # active window
+
+    assert agent._needs_confirmation("ssh pi@raspberrypi.local 'ls'") is True
+    assert agent._needs_confirmation("scp file.py pi@host:/tmp/") is True
+
+
+def test_always_confirm_list_has_priority_over_plan_window() -> None:
+    """always_confirm entries must be blocked even during a confirmed plan."""
+    agent = AIAgent(
+        config={"always_confirm": ["rm", "sudo"]},
+        terminal_manager=DummyTM(),
+        on_message=lambda _r, _t: None,
+        on_confirm_request=lambda _title, _detail, callback: callback(True),
+        on_status=lambda _s: None,
+        arduino_manager=DummyArduinoManager(),
+    )
+    agent.skip_confirmations_until = time.time() + 300  # active window
+
+    assert agent._needs_confirmation("rm -rf /tmp/test") is True
+    assert agent._needs_confirmation("sudo apt-get install curl") is True
+
+
+def test_plan_steps_capped_at_max() -> None:
+    """_extract_plan_steps must not return more than _MAX_PLAN_STEPS items."""
+    agent = _agent()
+    lines = "\n".join(f"{i}. Step {i}" for i in range(1, 25))  # 24 steps
+    steps = agent._extract_plan_steps(lines)
+
+    assert len(steps) <= agent._MAX_PLAN_STEPS
+
+
+def test_skip_confirmation_window_expires() -> None:
+    """After the window expires, normal confirmation rules apply."""
+    agent = _agent()
+    agent.skip_confirmations_until = time.time() - 1  # already expired
+
+    # A plain command with no explicit rule should NOT skip confirmation
+    # when confirm_readonly is False (default) → returns False (no confirmation needed)
+    # but should behave normally, not as if in plan window.
+    assert agent._needs_confirmation("ls /tmp") is False  # low-risk, no rule
+    # An SSH command must still require confirmation.
+    assert agent._needs_confirmation("ssh user@host") is True
