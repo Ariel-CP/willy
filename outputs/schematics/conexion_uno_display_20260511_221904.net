@@ -1,0 +1,8 @@
+# Willy IoT Netlist
+BOARD arduino uno
+NETS 4
+
+N001 UNO D2 -> U1 CLK [CLK]
+N002 UNO D3 -> U1 DIO [DATA]
+N003 UNO 5V -> U1 VCC [POWER]
+N004 UNO GND -> U1 GND [GND]

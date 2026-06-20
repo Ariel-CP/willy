@@ -1,0 +1,8 @@
+title,Contador de Display TM1637
+board,Arduino Uno
+components,2
+connections,4
+
+id,type,label,value,notes
+C1,Arduino,Arduino Uno,,
+C2,Display,TM1637 4-Digit 7-Segment,,Common board with CLK and DIO pins

@@ -9,6 +9,7 @@ import subprocess
 import json
 import re
 import os
+import glob
 from typing import Dict, List, Optional, Callable, Tuple
 from pathlib import Path
 
@@ -139,6 +140,15 @@ class ArduinoManager:
             ]
         """
         if not self.platformio_path:
+            # Keep scan usable even when PlatformIO is not installed.
+            devices = self._detect_with_pyserial()
+            if devices:
+                return devices
+
+            devices = self._detect_with_dev_glob()
+            if devices:
+                return devices
+
             self.on_error("PlatformIO not available for device detection")
             return []
         
@@ -162,7 +172,59 @@ class ArduinoManager:
             return devices
         except Exception as e:
             self.on_error(f"Device detection error: {str(e)}")
+            # Graceful fallback when PlatformIO call fails at runtime.
+            devices = self._detect_with_pyserial()
+            if devices:
+                return devices
+            return self._detect_with_dev_glob()
+
+    def _detect_with_pyserial(self) -> List[Dict]:
+        """Best-effort serial port detection using pyserial if available."""
+        try:
+            from serial.tools import list_ports
+        except Exception:
             return []
+
+        devices: List[Dict] = []
+        try:
+            for port_info in list_ports.comports():
+                port = str(getattr(port_info, "device", "") or "")
+                if not self._is_serial_port(port):
+                    continue
+
+                description = str(getattr(port_info, "description", "") or "")
+                hwid = str(getattr(port_info, "hwid", "") or "")
+                board = self._infer_board_from_hwid(hwid, description)
+                devices.append({
+                    "port": port,
+                    "description": description or "Serial device",
+                    "hwid": hwid,
+                    "board": board,
+                })
+        except Exception:
+            return []
+
+        return devices
+
+    def _detect_with_dev_glob(self) -> List[Dict]:
+        """Last-resort Linux/macOS device detection without extra dependencies."""
+        candidates: List[str] = []
+        candidates.extend(sorted(glob.glob("/dev/ttyUSB*")))
+        candidates.extend(sorted(glob.glob("/dev/ttyACM*")))
+        candidates.extend(sorted(glob.glob("/dev/cu.*")))
+
+        devices: List[Dict] = []
+        for port in candidates:
+            if not self._is_serial_port(port):
+                continue
+            devices.append({
+                "port": port,
+                "description": "Serial device (fallback scan)",
+                "hwid": "",
+                "board": "unknown",
+            })
+
+        return devices
 
     def _parse_pio_device_output(self, output: str) -> List[Dict]:
         """Parse PlatformIO device list output (pipe or multiline formats)."""

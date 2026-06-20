@@ -1,0 +1,9 @@
+title,wiring_std_rules_demo2
+board,arduino uno
+components,3
+connections,7
+
+id,type,label,value,notes
+U1,sensor,BME280,,
+U2,module,GPS,,
+U3,display,OLED,,

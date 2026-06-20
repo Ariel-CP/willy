@@ -1,0 +1,17 @@
+# Willy IoT Netlist
+BOARD Arduino Uno
+NETS 13
+
+N001 Arduino Pin 2 -> 4-Digit 7-Segment Digit 1 [Control]
+N002 Arduino Pin 3 -> 4-Digit 7-Segment Digit 2 [Control]
+N003 Arduino Pin 4 -> 4-Digit 7-Segment Digit 3 [Control]
+N004 Arduino Pin 5 -> 4-Digit 7-Segment Digit 4 [Control]
+N005 Arduino Pin 6 -> 4-Digit 7-Segment Seg A [Control]
+N006 Arduino Pin 7 -> 4-Digit 7-Segment Seg B [Control]
+N007 Arduino Pin 8 -> 4-Digit 7-Segment Seg C [Control]
+N008 Arduino Pin 9 -> 4-Digit 7-Segment Seg D [Control]
+N009 Arduino Pin 10 -> 4-Digit 7-Segment Seg E [Control]
+N010 Arduino Pin 11 -> 4-Digit 7-Segment Seg F [Control]
+N011 Arduino Pin 12 -> 4-Digit 7-Segment Seg G [Control]
+N012 Arduino Pin 13 -> 4-Digit 7-Segment Seg DP [Control]
+N013 4-Digit 7-Segment Common -> 3.3V [Power]

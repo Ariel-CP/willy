@@ -1,0 +1,10 @@
+title,sensor_temp_demo
+board,esp32
+components,4
+connections,3
+
+id,type,label,value,notes
+U1,board,ESP32 DevKit,,
+R1,resistor,R 220ohm,220R,
+D1,led,LED status,,
+S1,sensor,DHT22,,

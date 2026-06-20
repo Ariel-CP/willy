@@ -1,0 +1,6 @@
+# Willy IoT Netlist
+BOARD Arduino Uno
+NETS 2
+
+N001 A1 -> D2 [CLK]
+N002 A2 -> D3 [DIO]

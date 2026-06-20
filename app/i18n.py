@@ -27,6 +27,7 @@ _STRINGS = {
         "file_selected": "📄 Archivo seleccionado: {path}",
         "file_send_msg": "Mostrá el contenido de: {path}",
         "ai_thinking": "IA pensando…",
+        "ai_usage_status": "IA: {model} | Tokens usados: {used} | Restantes: {remaining} | Credito: {credit_percent}%",
         # Terminal panel
         "terminal_header": " TERMINAL",
         "stop_btn": "■ Detener",
@@ -87,6 +88,7 @@ _STRINGS = {
         "file_selected": "📄 Selected file: {path}",
         "file_send_msg": "Show me the contents of: {path}",
         "ai_thinking": "AI thinking…",
+        "ai_usage_status": "AI: {model} | Tokens used: {used} | Remaining: {remaining} | Credit: {credit_percent}%",
         # Terminal panel
         "terminal_header": " TERMINAL",
         "stop_btn": "■ Stop",

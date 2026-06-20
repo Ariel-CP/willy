@@ -1,0 +1,53 @@
+{
+  "system": {
+    "hostname": "ariel-Lap",
+    "username": "ariel",
+    "os": "Linux",
+    "release": "7.0.0-22-generic",
+    "machine": "x86_64",
+    "python_version": "3.14.4"
+  },
+  "network": {
+    "local_ips": [],
+    "raspberry_candidates": []
+  },
+  "tools": {
+    "python3": {
+      "available": true,
+      "path": "/usr/bin/python3",
+      "version": "Python 3.14.4"
+    },
+    "git": {
+      "available": true,
+      "path": "/usr/bin/git",
+      "version": "git version 2.53.0"
+    },
+    "ssh": {
+      "available": true,
+      "path": "/usr/bin/ssh",
+      "version": "OpenSSH_10.2p1 Ubuntu-2ubuntu3.2, OpenSSL 3.5.5 27 Jan 2026"
+    },
+    "pio": {
+      "available": false
+    },
+    "arduino-cli": {
+      "available": false
+    }
+  },
+  "embedded": {
+    "microcontrollers": [
+      {
+        "port": "/dev/ttyUSB0",
+        "description": "USB Serial",
+        "hwid": "USB VID:PID=1A86:7523 LOCATION=1-4",
+        "board": "arduino_uno"
+      }
+    ]
+  },
+  "preferences": {
+    "language": "es",
+    "theme": "dark",
+    "model": "gpt-4o",
+    "initial_directory": "/home/ariel"
+  }
+}

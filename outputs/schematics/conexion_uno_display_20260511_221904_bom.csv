@@ -1,0 +1,8 @@
+title,conexion_uno_display
+board,arduino uno
+components,2
+connections,4
+
+id,type,label,value,notes
+U1,display,HW-069,,
+R1,resistor,220R,,

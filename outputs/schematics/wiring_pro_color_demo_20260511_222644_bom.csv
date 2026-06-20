@@ -1,0 +1,9 @@
+title,wiring_pro_color_demo
+board,arduino uno
+components,3
+connections,13
+
+id,type,label,value,notes
+U1,display,TM1637,,
+U2,sensor,BME280,,
+U3,module,UART GPS,,

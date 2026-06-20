@@ -1,3 +1,5 @@
+import pytest
+
 from app.ai_agent import AIAgent
 
 
@@ -136,3 +138,28 @@ def test_ssh_command_always_requires_confirmation() -> None:
 
     assert agent._needs_confirmation("ssh pi@raspberrypi.local 'uname -a'") is True
     assert agent._needs_confirmation("scp main.py pi@raspberrypi.local:/home/pi/") is True
+
+
+def test_get_client_falls_back_to_config_key_when_env_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    class DummyClient:
+        def __init__(self, api_key: str) -> None:
+            captured["api_key"] = api_key
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("app.ai_agent.openai.OpenAI", DummyClient)
+
+    agent = AIAgent(
+        config={"api_key_source": "env", "openai_api_key": "sk-config-123"},
+        terminal_manager=DummyTM(),
+        on_message=lambda _r, _t: None,
+        on_confirm_request=lambda _title, _detail, callback: callback(True),
+        on_status=lambda _s: None,
+        arduino_manager=DummyArduinoManager(),
+    )
+
+    client = agent._get_client()
+
+    assert isinstance(client, DummyClient)
+    assert captured["api_key"] == "sk-config-123"

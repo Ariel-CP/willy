@@ -1,0 +1,9 @@
+title,wiring_pro_demo
+board,arduino uno
+components,3
+connections,9
+
+id,type,label,value,notes
+U1,display,TM1637 HW-069,,
+S1,sensor,DHT11,,
+R1,resistor,10k,,

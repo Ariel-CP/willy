@@ -1,0 +1,8 @@
+title,Display Counter
+board,arduino
+components,2
+connections,2
+
+id,type,label,value,notes
+C1,SevSeg,Display de 7 Segmentos,,"4 dígitos, ánodo común"
+C2,Resistor,Resistencias,,Conectadas en segmentos

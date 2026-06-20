@@ -15,6 +15,7 @@ from typing import Callable, Optional
 
 import openai
 from app import i18n
+from app.flowchart_manager import FlowchartManager
 from app.iot_diagram_manager import IoTDiagramManager
 from app.security_utils import redact_sensitive_text
 
@@ -284,6 +285,27 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "generate_flowchart",
+            "description": "Generate a Mermaid-first flowchart from a software project and save .mmd/.svg/.png outputs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to the project directory.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional flowchart title.",
+                    },
+                },
+                "required": ["project_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_iot_schematic",
             "description": "Generate an IoT electronic schematic diagram (PNG/SVG) and BOM from components and connections.",
             "parameters": {
@@ -438,6 +460,8 @@ class AIAgent:
         on_file_written: Optional[Callable[[str, str], None]] = None,
         on_schematic_generated: Optional[Callable[[str, str], None]] = None,
         environment_context_provider: Optional[Callable[[], str]] = None,
+        on_flowchart_generated: Optional[Callable[[str, str], None]] = None,
+        on_usage_update: Optional[Callable[[dict], None]] = None,
     ):
         """
         Parameters
@@ -460,8 +484,13 @@ class AIAgent:
         self.on_schematic_generated = on_schematic_generated
         self.environment_context_provider = environment_context_provider
         self.diagram_manager = IoTDiagramManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
+        self.flowchart_manager = FlowchartManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
+        self.on_flowchart_generated = on_flowchart_generated
+        self.on_usage_update = on_usage_update
         self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         self._client: Optional[openai.OpenAI] = None
+        self.session_token_budget = int(self.config.get("session_token_budget", 100_000) or 100_000)
+        self.session_total_tokens = 0
         
         # Plan mode state
         self.plan_steps: list[str] = []
@@ -542,7 +571,10 @@ class AIAgent:
             config_key = self.config.get("openai_api_key", "").strip()
             env_key = os.getenv("OPENAI_API_KEY", "").strip()
             source = self._resolve_api_source(config_key)
-            api_key = env_key if source == "env" else config_key
+            if source == "env":
+                api_key = env_key if self._is_configured_api_key(env_key) else config_key
+            else:
+                api_key = config_key if self._is_configured_api_key(config_key) else env_key
 
             if not self._is_configured_api_key(api_key):
                 raise ValueError(
@@ -669,6 +701,7 @@ class AIAgent:
                     raise
 
                 msg = response.choices[0].message
+                self._record_response_usage(getattr(response, "usage", None), model=model)
                 self.history.append(msg.to_dict())
 
                 # Check for plan in assistant's response
@@ -780,6 +813,7 @@ class AIAgent:
             "build_microcontroller": self._tool_build_microcontroller,
             "upload_microcontroller": self._tool_upload_microcontroller,
             "flash_sketch_file": self._tool_flash_sketch_file,
+            "generate_flowchart": self._tool_generate_flowchart,
             "generate_iot_schematic": self._tool_generate_iot_schematic,
         }
         handler = dispatch.get(name)
@@ -1430,6 +1464,78 @@ class AIAgent:
             f"NETLIST: {result.netlist_path}",
         ]
         return "\n".join(lines)
+
+    def _tool_generate_flowchart(self, args: dict) -> str:
+        project_path = self._resolve_path((args.get("project_path") or "").strip())
+        title = (args.get("title") or "").strip()
+
+        if not project_path:
+            return "Error: project_path is required."
+
+        result = self.flowchart_manager.generate_from_project(project_path=project_path, title=title)
+        if not result.ok:
+            return f"Error generating flowchart: {result.message}"
+
+        if callable(self.on_flowchart_generated):
+            try:
+                self.on_flowchart_generated(result.svg_path, result.mmd_path)
+            except Exception:
+                pass
+
+        lines = [
+            "Flowchart generated successfully.",
+            f"Project: {result.project_path}",
+            f"Mermaid: {result.mmd_path}",
+        ]
+        if result.svg_path:
+            lines.append(f"SVG: {result.svg_path}")
+        if result.png_path:
+            lines.append(f"PNG: {result.png_path}")
+        lines.append(f"Notes: {result.message}")
+        return "\n".join(lines)
+
+    def generate_flowchart_for_project(self, project_path: str, title: str = "") -> None:
+        def _run() -> None:
+            output = self._tool_generate_flowchart({"project_path": project_path, "title": title})
+            if callable(self.on_message):
+                try:
+                    self.on_message("system", output)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _record_response_usage(self, usage, *, model: str | None = None) -> dict | None:
+        if usage is None:
+            return None
+
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+
+        self.session_total_tokens += total_tokens
+        remaining = max(0, int(self.session_token_budget) - int(self.session_total_tokens))
+        credit_percent = int((remaining / max(1, int(self.session_token_budget))) * 100)
+
+        payload = {
+            "model": model or self.config.get("model", "gpt-4o"),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "session_total_tokens": int(self.session_total_tokens),
+            "session_remaining_tokens": remaining,
+            "session_credit_percent": credit_percent,
+            "session_budget_tokens": int(self.session_token_budget),
+            "status_text": f"AI tokens: {self.session_total_tokens}/{self.session_token_budget}",
+        }
+
+        if callable(self.on_usage_update):
+            try:
+                self.on_usage_update(payload)
+            except Exception:
+                pass
+
+        return payload
 
     def _log_event(self, event_type: str, payload: dict) -> None:
         """Best-effort local logging for debugging tool-call failures."""

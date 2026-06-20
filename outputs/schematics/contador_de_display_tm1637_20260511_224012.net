@@ -1,0 +1,8 @@
+# Willy IoT Netlist
+BOARD Arduino Uno
+NETS 4
+
+N001 Arduino GND -> TM1637 GND [Ground]
+N002 Arduino 5V -> TM1637 VCC [Power]
+N003 Arduino Pin 2 -> TM1637 CLK [Clock]
+N004 Arduino Pin 3 -> TM1637 DIO [Data]

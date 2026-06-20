@@ -1,0 +1,5 @@
+# Willy IoT Netlist
+BOARD arduino uno
+NETS 1
+
+N001 Pines del display -> Pines digitales del Arduino [Control del display]

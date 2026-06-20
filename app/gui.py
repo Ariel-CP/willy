@@ -28,6 +28,7 @@ from app.chat_panel import ChatPanel
 from app.file_browser import FileBrowser
 from app.ai_agent import AIAgent
 from app.environment_memory import EnvironmentMemory
+from app.learned_memory import LearnedMemory
 from app.session_logger import SessionLogger
 from app.tts import TTSEngine
 from app.arduino_manager import ArduinoManager
@@ -135,6 +136,9 @@ class WillyApp(ctk.CTk):
             on_command_done=self.session_logger.log_command,
         )
         self.environment_memory = EnvironmentMemory(
+            base_dir=os.path.dirname(os.path.dirname(__file__)),
+        )
+        self.learned_memory = LearnedMemory(
             base_dir=os.path.dirname(os.path.dirname(__file__)),
         )
 
@@ -896,7 +900,13 @@ class WillyApp(ctk.CTk):
     def _environment_context_for_agent(self) -> str:
         try:
             self._refresh_environment_memory()
-            return self.environment_memory.summary_for_prompt()
+            env_context = self.environment_memory.summary_for_prompt()
+            project_path = self._resolve_project_path_for_actions()
+            learned_context = self.learned_memory.summary_for_prompt(project_path=project_path)
+
+            if env_context and learned_context:
+                return env_context + "\n\n" + learned_context
+            return env_context or learned_context
         except Exception:
             return ""
 
@@ -1198,6 +1208,18 @@ class WillyApp(ctk.CTk):
         else:
             err = result.get("error", "Error desconocido")
             self.chat_panel.add_message("error", f"Fallo compilacion: {err}")
+
+        try:
+            self.learned_memory.record_project_event(
+                project_path=project_path,
+                action="compile",
+                success=ok,
+                summary=f"compile env={env or 'default'}",
+                error=str(result.get("error", "")),
+            )
+        except Exception as exc:
+            self._on_system_error(str(exc), component="learned_memory")
+
         self.after(2200, lambda: self._set_code_action_indicator("idle"))
 
     def _start_upload(self) -> None:
@@ -1226,6 +1248,18 @@ class WillyApp(ctk.CTk):
         else:
             err = result.get("error", "Error desconocido")
             self.chat_panel.add_message("error", f"Fallo grabacion: {err}")
+
+        try:
+            self.learned_memory.record_project_event(
+                project_path=project_path,
+                action="upload",
+                success=ok,
+                summary=f"upload env={env or 'default'} port={port}",
+                error=str(result.get("error", "")),
+            )
+        except Exception as exc:
+            self._on_system_error(str(exc), component="learned_memory")
+
         self.after(2200, lambda: self._set_code_action_indicator("idle"))
 
     def _open_expanded_code_view(self) -> None:
