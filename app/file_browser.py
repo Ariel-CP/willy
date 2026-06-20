@@ -11,12 +11,20 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 import customtkinter as ctk
 from typing import Callable
 from app import i18n
+from app.new_project_dialog import NewProjectDialog
 
 
 class FileBrowser(ctk.CTkFrame):
-    def __init__(self, master, on_file_selected: Callable[[str], None], **kwargs):
+    def __init__(
+        self,
+        master,
+        on_file_selected: Callable[[str], None],
+        on_new_project: Callable[[str], None] | None = None,
+        **kwargs,
+    ):
         super().__init__(master, **kwargs)
         self._on_file_selected = on_file_selected
+        self._on_new_project = on_new_project
         self._root_path = os.path.expanduser("~")
         self._build_ui()
         self._populate(self._root_path)
@@ -43,6 +51,17 @@ class FileBrowser(ctk.CTkFrame):
 
         ctk.CTkButton(
             header,
+            text="＋",
+            width=28,
+            height=24,
+            font=ctk.CTkFont(size=13),
+            fg_color=("#16a34a", "#15803d"),
+            hover_color=("#15803d", "#166534"),
+            command=self._open_new_project_dialog,
+        ).grid(row=0, column=1, padx=(0, 2), pady=6)
+
+        ctk.CTkButton(
+            header,
             text="↑",
             width=28,
             height=24,
@@ -50,7 +69,7 @@ class FileBrowser(ctk.CTkFrame):
             fg_color=("gray70", "gray35"),
             hover_color=("gray60", "gray45"),
             command=self._go_up,
-        ).grid(row=0, column=1, padx=(0, 4), pady=6)
+        ).grid(row=0, column=2, padx=(0, 2), pady=6)
 
         ctk.CTkButton(
             header,
@@ -61,7 +80,7 @@ class FileBrowser(ctk.CTkFrame):
             fg_color=("gray70", "gray35"),
             hover_color=("gray60", "gray45"),
             command=lambda: self._populate(self._root_path),
-        ).grid(row=0, column=2, padx=(0, 6), pady=6)
+        ).grid(row=0, column=3, padx=(0, 6), pady=6)
 
         # Current path label
         self.path_label = ctk.CTkLabel(
@@ -177,6 +196,19 @@ class FileBrowser(ctk.CTkFrame):
             return None
         values = self.tree.item(selected[0], "values")
         return values[0] if values else None
+
+    def _open_new_project_dialog(self) -> None:
+        NewProjectDialog(
+            self,
+            initial_dir=self._root_path,
+            on_created=self._on_project_created,
+        )
+
+    def _on_project_created(self, project_path: str) -> None:
+        """Navega al proyecto recién creado y notifica al callback externo."""
+        self._populate(project_path)
+        if self._on_new_project:
+            self._on_new_project(project_path)
 
     def _create_folder(self) -> None:
         base = self._selected_path() or self._root_path

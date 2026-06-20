@@ -17,7 +17,7 @@ class ConfirmDialog(ctk.CTkToplevel):
         super().__init__(master)
         self.title(title)
         self.resizable(False, False)
-        self.grab_set()
+        self.after(100, self._safe_grab)
         self._callback = callback
 
         self.grid_columnconfigure(0, weight=1)
@@ -63,6 +63,12 @@ class ConfirmDialog(ctk.CTkToplevel):
         ).pack(side="left")
 
         self._center()
+
+    def _safe_grab(self) -> None:
+        try:
+            self.grab_set()
+        except Exception:
+            pass  # Ventana no visible aún (ej: tests headless)
 
     def _center(self) -> None:
         self.update_idletasks()

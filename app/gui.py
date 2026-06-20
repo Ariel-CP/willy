@@ -156,6 +156,7 @@ class WillyApp(ctk.CTk):
         self.file_browser = FileBrowser(
             self,
             on_file_selected=self._on_file_selected,
+            on_new_project=self._on_new_project,
             width=200,
             fg_color=("gray90", "gray12"),
         )
@@ -492,14 +493,13 @@ class WillyApp(ctk.CTk):
             anchor="w",
         ).grid(row=5, column=0, sticky="w", padx=8, pady=(4, 2))
 
-        self.diagram_preview = tk.Label(
+        self.diagram_preview = ctk.CTkLabel(
             dashboard,
             text="Sin preview disponible",
-            bg="#0d1117",
-            fg="#9ca3af",
+            fg_color=("gray85", "#0d1117"),
+            text_color=("gray50", "#9ca3af"),
             anchor="center",
-            justify="center",
-            height=6,
+            height=120,
         )
         self.diagram_preview.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 6))
 
@@ -669,13 +669,13 @@ class WillyApp(ctk.CTk):
         target_top_h = max(min_top, min(target_top_h, right_h - min_bottom))
 
         if right_h < 650:
-            preview_height = 4
+            preview_height = 80
             code_height = 110
         elif right_h < 780:
-            preview_height = 5
+            preview_height = 100
             code_height = 130
         else:
-            preview_height = 6
+            preview_height = 120
             code_height = 150
 
         signature = (target_top_h, preview_height, code_height)
@@ -1060,6 +1060,20 @@ class WillyApp(ctk.CTk):
         self.chat_panel.add_message("system", i18n.get("file_selected", path=path))
         self._update_code_preview(path)
         self.ai_agent.send(i18n.get("file_send_msg", path=path))
+
+    def _on_new_project(self, project_path: str) -> None:
+        """Callback cuando el usuario crea un nuevo proyecto desde el diálogo."""
+        self.session_logger.log_event(
+            "new_project",
+            component="gui",
+            data={"project_path": project_path},
+        )
+        self.chat_panel.add_message(
+            "system",
+            f"Proyecto creado en: {project_path}\nPodés pedirme que genere el firmware o el diagrama."
+        )
+        # Actualizar memoria aprendida con el nuevo proyecto
+        self.after(800, self._refresh_memory_panel)
 
     def _on_schematic_generated(self, svg_path: str, bom_path: str) -> None:
         # Called from agent worker thread; marshal to UI thread.
@@ -1799,7 +1813,7 @@ class WillyApp(ctk.CTk):
         if not svg_path or not os.path.isfile(svg_path):
             self._schematic_preview_image = None
             self._schematic_preview_photo = None
-            self.diagram_preview.configure(image="", text="Sin preview disponible")
+            self.diagram_preview.configure(image=None, text="Sin preview disponible")
             return
 
         png_candidate = os.path.splitext(svg_path)[0] + ".png"
@@ -1820,7 +1834,7 @@ class WillyApp(ctk.CTk):
             self._schematic_preview_image = None
             self._schematic_preview_photo = None
             self.diagram_preview.configure(
-                image="",
+                image=None,
                 text="Preview no disponible. Usa 'Abrir' para ver el SVG.",
             )
             return
@@ -1828,14 +1842,19 @@ class WillyApp(ctk.CTk):
         try:
             image = Image.open(source_image_path)
             image.thumbnail((760, 300), Image.Resampling.LANCZOS)
-            self._schematic_preview_photo = ImageTk.PhotoImage(image)
+            ctk_img = ctk.CTkImage(
+                light_image=image,
+                dark_image=image,
+                size=(image.width, image.height),
+            )
+            self._schematic_preview_photo = ctk_img
             self._schematic_preview_image = image
-            self.diagram_preview.configure(image=self._schematic_preview_photo, text="")
+            self.diagram_preview.configure(image=ctk_img, text="")
         except Exception:
             self._schematic_preview_image = None
             self._schematic_preview_photo = None
             self.diagram_preview.configure(
-                image="",
+                image=None,
                 text="No se pudo cargar preview del diagrama.",
             )
 
