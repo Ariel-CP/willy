@@ -293,8 +293,8 @@ TOOLS = [
                 "properties": {
                     "action": {
                         "type": "string",
-                        "description": "One of: detect, snapshot, install, update, rollback, summary.",
-                        "enum": ["detect", "snapshot", "install", "update", "rollback", "summary"]
+                        "description": "One of: detect, snapshot, install, update, rollback, summary, sanitize_pio.",
+                        "enum": ["detect", "snapshot", "install", "update", "rollback", "summary", "sanitize_pio"]
                     },
                     "ecosystem": {
                         "type": "string",
@@ -441,6 +441,7 @@ Guidelines:
 - **Traceability (mandatory):** When using web data, ALWAYS include: source URL, date consulted, and source quality level (official/community). Example: "Source: https://... | consulted: 2026-06-20 | quality: official_docs"
 - Be concise and helpful. Respond in the same language the user uses.
 - If a tool or command fails, analyze the error output and suggest a fix.
+- **platformio.ini rule:** ALWAYS use `read_file` to inspect the current content of `platformio.ini` BEFORE writing it. When modifying `lib_deps`, write the COMPLETE replacement block — never append to existing entries. Duplicate lib_deps entries (same library, different owner) cause build failures. If you detect a build error caused by an unknown package, use `manage_dependencies` with action `sanitize_pio` to auto-clean duplicates.
 
 **PLAN MODE (for multi-step operations):**
 When the user asks you to perform multiple steps (e.g., "create a Python project", "set up a server", "configure something"), you MUST:
@@ -1752,7 +1753,17 @@ class AIAgent:
             status = "OK" if result.ok else "FAILED"
             return f"[{status}] rollback {ecosystem}: {result.message}"
 
-        return f"Error: unknown action '{action}'. Use: detect, snapshot, install, update, rollback, summary."
+        if action == "sanitize_pio":
+            return self._tool_sanitize_pio_ini(project_path or ".")
+
+        return f"Error: unknown action '{action}'. Use: detect, snapshot, install, update, rollback, summary, sanitize_pio."
+        """Deduplica lib_deps en platformio.ini del proyecto dado."""
+        if not self.arduino_manager:
+            return "Error: Arduino support not available."
+        ini_path = os.path.join(self._resolve_path(project_path), "platformio.ini")
+        from app.arduino_manager import ArduinoManager
+        msg = ArduinoManager.sanitize_lib_deps(ini_path)
+        return msg if msg else "platformio.ini ya estaba limpio, sin duplicados."
 
     def _tool_generate_flowchart(self, args: dict) -> str:
         project_path = self._resolve_path((args.get("project_path") or "").strip())

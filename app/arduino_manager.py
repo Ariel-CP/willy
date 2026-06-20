@@ -14,6 +14,28 @@ from typing import Dict, List, Optional, Callable, Tuple
 from pathlib import Path
 
 
+def _lib_base_name(entry: str) -> str:
+    """
+    Extrae el nombre base de una entrada de lib_deps de PlatformIO.
+    Ejemplos:
+      "marcoschwartz/LiquidCrystal_I2C @ ^1.1.4"  → "liquidcrystal_i2c"
+      "johnrickman/LiquidCrystal_I2C@^1.1.4"       → "liquidcrystal_i2c"
+      "adafruit/RTClib @ ^1.14.2"                   → "rtclib"
+      "Wire"                                         → "wire"
+    """
+    entry = entry.strip()
+    if not entry or entry.startswith(("#", ";")):
+        return ""
+    # Quitar comentarios inline
+    entry = re.split(r"\s*[;#]", entry)[0].strip()
+    # Quitar specifier de versión
+    name_part = re.split(r"\s*@", entry)[0].strip()
+    # Quitar owner (parte antes del /)
+    if "/" in name_part:
+        name_part = name_part.split("/", 1)[1]
+    return name_part.strip().lower()
+
+
 class ArduinoManager:
     """Manages microcontroller operations via PlatformIO."""
     
@@ -514,6 +536,90 @@ class ArduinoManager:
             lines.append(f"  {idx}. [{ok}] {action} ({env}{port_part}){err_part}")
         return "\n".join(lines)
 
+    @staticmethod
+    def sanitize_lib_deps(ini_path: str) -> str | None:
+        """
+        Lee el platformio.ini, detecta entradas duplicadas en lib_deps y conserva
+        solo la primera ocurrencia de cada librería (por nombre base, ignorando el owner).
+
+        Devuelve un mensaje con los cambios realizados, o None si no hubo cambios.
+        """
+        if not os.path.isfile(ini_path):
+            return None
+
+        try:
+            with open(ini_path, "r", encoding="utf-8") as fh:
+                original = fh.read()
+        except OSError:
+            return None
+
+        lines = original.splitlines(keepends=True)
+        new_lines: list[str] = []
+        in_lib_deps = False
+        seen_names: dict[str, str] = {}   # nombre_base → primera entry que lo declaró
+        removed: list[str] = []
+
+        for line in lines:
+            stripped = line.rstrip()
+
+            # Detectar inicio del bloque lib_deps
+            if re.match(r"^\s*lib_deps\s*=", stripped):
+                in_lib_deps = True
+                new_lines.append(line)
+                # Valor en la misma línea (lib_deps = algo)
+                inline = re.sub(r"^\s*lib_deps\s*=\s*", "", stripped).strip()
+                if inline:
+                    base = _lib_base_name(inline)
+                    if base and base not in seen_names:
+                        seen_names[base] = inline
+                    elif base:
+                        removed.append(inline)
+                        # Reemplazar el inline en la línea recién agregada por vacío
+                        new_lines[-1] = re.sub(
+                            r"(lib_deps\s*=\s*).*", r"\1", new_lines[-1]
+                        ) + "\n"
+                continue
+
+            # Dentro del bloque lib_deps: líneas de continuación (empiezan con espacio/tab)
+            if in_lib_deps:
+                if stripped and not stripped.startswith((" ", "\t")) and "=" not in stripped:
+                    # Línea de sección nueva, fin del bloque
+                    in_lib_deps = False
+                    new_lines.append(line)
+                    continue
+
+                entry = stripped.strip()
+                if entry:
+                    base = _lib_base_name(entry)
+                    if base and base not in seen_names:
+                        seen_names[base] = entry
+                        new_lines.append(line)
+                    elif base:
+                        removed.append(entry)
+                        # Omitir la línea duplicada
+                    else:
+                        new_lines.append(line)
+                else:
+                    new_lines.append(line)
+                continue
+
+            new_lines.append(line)
+
+        if not removed:
+            return None
+
+        new_content = "".join(new_lines)
+        try:
+            with open(ini_path, "w", encoding="utf-8") as fh:
+                fh.write(new_content)
+        except OSError as exc:
+            return f"sanitize_lib_deps: could not write {ini_path}: {exc}"
+
+        return (
+            f"lib_deps sanitizado: eliminadas {len(removed)} entradas duplicadas: "
+            + ", ".join(removed)
+        )
+
     def _preflight_before_build_upload(
         self,
         project_path: str,
@@ -532,6 +638,11 @@ class ArduinoManager:
         ini_path = os.path.join(project_path, "platformio.ini")
         if not os.path.exists(ini_path):
             return False, messages, f"platformio.ini not found in {project_path}"
+
+        # Sanear lib_deps antes de cualquier intento de instalación/build
+        sanitize_msg = self.sanitize_lib_deps(ini_path)
+        if sanitize_msg:
+            messages.append(f"[Auto-fix] {sanitize_msg}")
 
         info = self.get_project_info(project_path)
         if not info.get("ok"):

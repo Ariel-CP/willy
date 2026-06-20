@@ -156,3 +156,65 @@ def test_build_blocks_on_preflight_failure(tmp_path: Path) -> None:
 
     assert result["ok"] is False
     assert "preflight failed" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# sanitize_lib_deps tests
+# ---------------------------------------------------------------------------
+
+def test_sanitize_lib_deps_removes_duplicate_different_owner(tmp_path: Path) -> None:
+    """Dos entradas del mismo lib con distintos owners → queda solo la primera."""
+    ini = tmp_path / "platformio.ini"
+    ini.write_text(
+        "[env:uno]\nplatform = atmelavr\nboard = uno\nframework = arduino\n"
+        "lib_deps =\n"
+        "    marcoschwartz/LiquidCrystal_I2C @ ^1.1.4\n"
+        "    adafruit/RTClib @ ^1.14.2\n"
+        "    johnrickman/LiquidCrystal_I2C@^1.1.4\n",
+        encoding="utf-8",
+    )
+
+    msg = ArduinoManager.sanitize_lib_deps(str(ini))
+
+    assert msg is not None
+    assert "johnrickman" in msg
+    content = ini.read_text(encoding="utf-8")
+    assert "marcoschwartz/LiquidCrystal_I2C" in content
+    assert "johnrickman" not in content
+    assert "RTClib" in content  # otras dependencias deben conservarse
+
+
+def test_sanitize_lib_deps_removes_exact_duplicates(tmp_path: Path) -> None:
+    """La misma entrada repetida dos veces → queda una sola."""
+    ini = tmp_path / "platformio.ini"
+    ini.write_text(
+        "[env:uno]\nplatform = atmelavr\nboard = uno\nframework = arduino\n"
+        "lib_deps =\n"
+        "    adafruit/RTClib @ ^1.14.2\n"
+        "    adafruit/RTClib@^1.14.2\n",
+        encoding="utf-8",
+    )
+
+    msg = ArduinoManager.sanitize_lib_deps(str(ini))
+
+    assert msg is not None
+    content = ini.read_text(encoding="utf-8")
+    assert content.count("RTClib") == 1
+
+
+def test_sanitize_lib_deps_no_change_when_clean(tmp_path: Path) -> None:
+    """Un ini sin duplicados no debe ser modificado y devuelve None."""
+    original = (
+        "[env:uno]\nplatform = atmelavr\nboard = uno\nframework = arduino\n"
+        "lib_deps =\n"
+        "    adafruit/RTClib @ ^1.14.2\n"
+        "    marcoschwartz/LiquidCrystal_I2C @ ^1.1.4\n"
+    )
+    ini = tmp_path / "platformio.ini"
+    ini.write_text(original, encoding="utf-8")
+
+    msg = ArduinoManager.sanitize_lib_deps(str(ini))
+
+    assert msg is None
+    assert ini.read_text(encoding="utf-8") == original
+
