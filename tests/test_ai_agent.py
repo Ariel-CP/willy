@@ -230,3 +230,85 @@ def test_skip_confirmation_window_expires() -> None:
     assert agent._needs_confirmation("ls /tmp") is False  # low-risk, no rule
     # An SSH command must still require confirmation.
     assert agent._needs_confirmation("ssh user@host") is True
+
+
+# ---------------------------------------------------------------------------
+# _repair_history tests
+# ---------------------------------------------------------------------------
+
+def test_repair_history_removes_dangling_tool_calls() -> None:
+    """
+    Dado un historial con un assistant+tool_calls sin respuesta tool,
+    _repair_history debe eliminar ese mensaje problemático conservando
+    los mensajes anteriores y el último mensaje user.
+    """
+    agent = _agent()
+    agent.history = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "primer mensaje"},
+        {"role": "assistant", "content": "respuesta previa"},
+        {"role": "user", "content": "segundo mensaje"},
+        # Este assistant quedó con tool_calls sin respuesta:
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call_abc", "type": "function", "function": {"name": "run_command", "arguments": "{}"}}],
+        },
+        # Falta el mensaje {"role": "tool", "tool_call_id": "call_abc", ...}
+    ]
+
+    repaired = agent._repair_history()
+
+    assert repaired is True
+    # La historia ya no contiene el assistant problemático
+    roles = [m["role"] for m in agent.history]
+    assert "tool" not in roles
+    # Los mensajes anteriores deben estar preservados
+    contents = [m.get("content") for m in agent.history]
+    assert "primer mensaje" in contents
+    assert "respuesta previa" in contents
+    # El último mensaje user debe estar al final para reintentarse
+    assert agent.history[-1]["role"] == "user"
+    assert agent.history[-1]["content"] == "segundo mensaje"
+
+
+def test_repair_history_removes_orphan_tool_messages() -> None:
+    """
+    Mensajes role=tool sin un assistant parent válido deben ser eliminados.
+    """
+    agent = _agent()
+    agent.history = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "pregunta"},
+        # tool huérfano — no hay assistant con tool_calls previamente
+        {"role": "tool", "tool_call_id": "call_xyz", "content": "resultado"},
+    ]
+
+    repaired = agent._repair_history()
+
+    assert repaired is True
+    roles = [m["role"] for m in agent.history]
+    assert "tool" not in roles
+    # El resto debe conservarse
+    assert any(m.get("content") == "pregunta" for m in agent.history)
+
+
+def test_repair_history_returns_false_when_clean() -> None:
+    """
+    Un historial sin tool_calls colgadas no debe ser modificado,
+    y _repair_history debe devolver False.
+    """
+    agent = _agent()
+    agent.history = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hola"},
+        {"role": "assistant", "content": "respuesta normal"},
+        {"role": "user", "content": "otra pregunta"},
+    ]
+    original = list(agent.history)
+
+    repaired = agent._repair_history()
+
+    assert repaired is False
+    assert agent.history == original
+

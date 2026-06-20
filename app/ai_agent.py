@@ -586,6 +586,61 @@ class AIAgent:
     def clear_history(self) -> None:
         self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+    def _repair_history(self) -> bool:
+        """
+        Elimina del historial sólo las tool_calls que quedaron sin respuesta,
+        conservando el resto de la conversación.
+
+        Devuelve True si se realizó alguna reparación.
+        """
+        repaired = False
+
+        # Pase 1: buscar el último mensaje assistant con tool_calls sin respuesta
+        i = len(self.history) - 1
+        while i >= 0:
+            msg = self.history[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                expected_ids = {tc["id"] for tc in msg["tool_calls"]}
+                responded_ids = {
+                    self.history[j].get("tool_call_id")
+                    for j in range(i + 1, len(self.history))
+                    if self.history[j].get("role") == "tool"
+                }
+                if not expected_ids.issubset(responded_ids):
+                    # Guardar el último mensaje user que venga después del corte
+                    last_user: dict | None = None
+                    for j in range(len(self.history) - 1, i, -1):
+                        if self.history[j].get("role") == "user":
+                            last_user = self.history[j]
+                            break
+                    # Cortar hasta antes del mensaje problemático
+                    self.history = self.history[:i]
+                    # Preservar el mensaje user para que se reintente
+                    if last_user is not None:
+                        self.history.append(last_user)
+                    repaired = True
+                    break
+            i -= 1
+
+        # Pase 2: eliminar mensajes tool huérfanos (sin assistant parent válido)
+        valid: list[dict] = []
+        for msg in self.history:
+            if msg.get("role") == "tool":
+                tid = msg.get("tool_call_id")
+                has_parent = any(
+                    tc.get("id") == tid
+                    for v in valid
+                    if v.get("role") == "assistant"
+                    for tc in (v.get("tool_calls") or [])
+                )
+                if not has_parent:
+                    repaired = True
+                    continue
+            valid.append(msg)
+        self.history = valid
+
+        return repaired
+
     def _build_request_messages(self) -> list[dict]:
         """Build request messages with optional dynamic environment context."""
         messages = list(self.history)
@@ -751,14 +806,22 @@ class AIAgent:
                         and "tool_call_ids did not have response messages" in err_text
                     ):
                         recovered_bad_history = True
-                        self.history = [
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": user_text},
-                        ]
-                        self.on_message(
-                            "system",
-                            "Se reinició el contexto de la conversación por un error interno de tool-calls. Podés continuar normalmente.",
-                        )
+                        repaired = self._repair_history()
+                        if not repaired:
+                            # Fallback: reset total si la reparación quirúrgica no encontró nada
+                            self.history = [
+                                {"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "user", "content": user_text},
+                            ]
+                            self.on_message(
+                                "system",
+                                "Se reinició el contexto de la conversación por un error interno de tool-calls. Podés continuar normalmente.",
+                            )
+                        else:
+                            self.on_message(
+                                "system",
+                                "Se recuperó el contexto anterior tras un error interno de tool-calls. La conversación continúa normalmente.",
+                            )
                         continue
                     raise
 
