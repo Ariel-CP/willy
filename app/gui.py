@@ -100,6 +100,7 @@ class WillyApp(ctk.CTk):
         self._last_layout_signature = None
         self._startup_diag_running = False
         self._session_errors: list[dict] = []
+        self._session_errors_lock = threading.Lock()
         self._error_log_window = None
 
         self._build_layout()
@@ -1080,7 +1081,8 @@ class WillyApp(ctk.CTk):
             "component": component,
             "message": message,
         }
-        self._session_errors.append(entry)
+        with self._session_errors_lock:
+            self._session_errors.append(entry)
         self.after(0, self._update_error_badge)
         # Refrescar ventana si está abierta
         self.after(0, self._refresh_error_log_if_open)
@@ -1088,7 +1090,8 @@ class WillyApp(ctk.CTk):
     def _update_error_badge(self) -> None:
         if not hasattr(self, "error_log_btn"):
             return
-        n = len(self._session_errors)
+        with self._session_errors_lock:
+            n = len(self._session_errors)
         if n == 0:
             self.error_log_btn.configure(
                 text="⚠ Sin errores",
@@ -1210,11 +1213,14 @@ class WillyApp(ctk.CTk):
         self._error_log_text.configure(state="normal")
         self._error_log_text.delete("0.0", "end")
 
-        if not self._session_errors:
+        with self._session_errors_lock:
+            errors_snapshot = list(self._session_errors)
+
+        if not errors_snapshot:
             self._error_log_text.insert("0.0", "No hay errores registrados en esta sesión.")
         else:
             lines = []
-            for i, e in enumerate(self._session_errors, 1):
+            for i, e in enumerate(errors_snapshot, 1):
                 lines.append(
                     f"[{e['timestamp']}] [{e['component'].upper()}]\n{e['message']}\n"
                     + "─" * 60
@@ -1244,7 +1250,9 @@ class WillyApp(ctk.CTk):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(f"Log de errores — sesión {_dt.now().isoformat()}\n")
                 fh.write("=" * 60 + "\n\n")
-                for e in self._session_errors:
+                with self._session_errors_lock:
+                    errors_snapshot = list(self._session_errors)
+                for e in errors_snapshot:
                     fh.write(f"[{e['timestamp']}] [{e['component'].upper()}]\n{e['message']}\n\n")
         except OSError as exc:
             from tkinter import messagebox as _mb
@@ -1260,7 +1268,8 @@ class WillyApp(ctk.CTk):
             pass
 
     def _clear_error_log(self) -> None:
-        self._session_errors.clear()
+        with self._session_errors_lock:
+            self._session_errors.clear()
         self._update_error_badge()
         self._refresh_error_log_if_open()
 

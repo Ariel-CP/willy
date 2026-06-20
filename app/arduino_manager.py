@@ -556,28 +556,38 @@ class ArduinoManager:
         lines = original.splitlines(keepends=True)
         new_lines: list[str] = []
         in_lib_deps = False
-        seen_names: dict[str, str] = {}   # nombre_base → primera entry que lo declaró
+        seen_names: dict[str, str] = {}   # nombre_base → primera entry que lo declaró (per sección)
         removed: list[str] = []
 
         for line in lines:
             stripped = line.rstrip()
 
+            # Nueva sección [env:...] — resetear estado por sección
+            if re.match(r"^\[", stripped):
+                in_lib_deps = False
+                seen_names = {}
+                new_lines.append(line)
+                continue
+
             # Detectar inicio del bloque lib_deps
             if re.match(r"^\s*lib_deps\s*=", stripped):
                 in_lib_deps = True
-                new_lines.append(line)
                 # Valor en la misma línea (lib_deps = algo)
                 inline = re.sub(r"^\s*lib_deps\s*=\s*", "", stripped).strip()
                 if inline:
                     base = _lib_base_name(inline)
                     if base and base not in seen_names:
                         seen_names[base] = inline
+                        new_lines.append(line)
                     elif base:
                         removed.append(inline)
-                        # Reemplazar el inline en la línea recién agregada por vacío
-                        new_lines[-1] = re.sub(
-                            r"(lib_deps\s*=\s*).*", r"\1", new_lines[-1]
-                        ) + "\n"
+                        # Quitar el valor inline pero mantener el key para las continuaciones
+                        prefix = re.match(r"^(\s*lib_deps\s*=\s*)", line).group(1)
+                        new_lines.append(prefix.rstrip() + "\n")
+                    else:
+                        new_lines.append(line)
+                else:
+                    new_lines.append(line)
                 continue
 
             # Dentro del bloque lib_deps: líneas de continuación (empiezan con espacio/tab)

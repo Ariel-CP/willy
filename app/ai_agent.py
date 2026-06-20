@@ -547,7 +547,9 @@ class AIAgent:
         self.on_flowchart_generated = on_flowchart_generated
         self.on_usage_update = on_usage_update
         self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._history_lock = threading.RLock()
         self._client: Optional[openai.OpenAI] = None
+        self._client_lock = threading.Lock()
         self.session_token_budget = int(self.config.get("session_token_budget", 100_000) or 100_000)
         self.session_total_tokens = 0
         
@@ -585,7 +587,8 @@ class AIAgent:
         threading.Thread(target=self._process, args=(user_text,), daemon=True).start()
 
     def clear_history(self) -> None:
-        self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+        with self._history_lock:
+            self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     def _repair_history(self) -> bool:
         """
@@ -596,55 +599,57 @@ class AIAgent:
         """
         repaired = False
 
-        # Pase 1: buscar el último mensaje assistant con tool_calls sin respuesta
-        i = len(self.history) - 1
-        while i >= 0:
-            msg = self.history[i]
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                expected_ids = {tc["id"] for tc in msg["tool_calls"]}
-                responded_ids = {
-                    self.history[j].get("tool_call_id")
-                    for j in range(i + 1, len(self.history))
-                    if self.history[j].get("role") == "tool"
-                }
-                if not expected_ids.issubset(responded_ids):
-                    # Guardar el último mensaje user que venga después del corte
-                    last_user: dict | None = None
-                    for j in range(len(self.history) - 1, i, -1):
-                        if self.history[j].get("role") == "user":
-                            last_user = self.history[j]
-                            break
-                    # Cortar hasta antes del mensaje problemático
-                    self.history = self.history[:i]
-                    # Preservar el mensaje user para que se reintente
-                    if last_user is not None:
-                        self.history.append(last_user)
-                    repaired = True
-                    break
-            i -= 1
+        with self._history_lock:
+            # Pase 1: buscar el último mensaje assistant con tool_calls sin respuesta
+            i = len(self.history) - 1
+            while i >= 0:
+                msg = self.history[i]
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    expected_ids = {tc["id"] for tc in msg["tool_calls"]}
+                    responded_ids = {
+                        self.history[j].get("tool_call_id")
+                        for j in range(i + 1, len(self.history))
+                        if self.history[j].get("role") == "tool"
+                    }
+                    if not expected_ids.issubset(responded_ids):
+                        # Guardar el último mensaje user que venga después del corte
+                        last_user: dict | None = None
+                        for j in range(len(self.history) - 1, i, -1):
+                            if self.history[j].get("role") == "user":
+                                last_user = self.history[j]
+                                break
+                        # Cortar hasta antes del mensaje problemático
+                        self.history = self.history[:i]
+                        # Preservar el mensaje user para que se reintente
+                        if last_user is not None:
+                            self.history.append(last_user)
+                        repaired = True
+                        break
+                i -= 1
 
-        # Pase 2: eliminar mensajes tool huérfanos (sin assistant parent válido)
-        valid: list[dict] = []
-        for msg in self.history:
-            if msg.get("role") == "tool":
-                tid = msg.get("tool_call_id")
-                has_parent = any(
-                    tc.get("id") == tid
-                    for v in valid
-                    if v.get("role") == "assistant"
-                    for tc in (v.get("tool_calls") or [])
-                )
-                if not has_parent:
-                    repaired = True
-                    continue
-            valid.append(msg)
-        self.history = valid
+            # Pase 2: eliminar mensajes tool huérfanos (sin assistant parent válido)
+            valid: list[dict] = []
+            for msg in self.history:
+                if msg.get("role") == "tool":
+                    tid = msg.get("tool_call_id")
+                    has_parent = any(
+                        tc.get("id") == tid
+                        for v in valid
+                        if v.get("role") == "assistant"
+                        for tc in (v.get("tool_calls") or [])
+                    )
+                    if not has_parent:
+                        repaired = True
+                        continue
+                valid.append(msg)
+            self.history = valid
 
         return repaired
 
     def _build_request_messages(self) -> list[dict]:
         """Build request messages with optional dynamic environment context."""
-        messages = list(self.history)
+        with self._history_lock:
+            messages = list(self.history)
         if not callable(self.environment_context_provider):
             return messages
 
@@ -682,19 +687,21 @@ class AIAgent:
 
     def _get_client(self) -> openai.OpenAI:
         if self._client is None:
-            config_key = self.config.get("openai_api_key", "").strip()
-            env_key = os.getenv("OPENAI_API_KEY", "").strip()
-            source = self._resolve_api_source(config_key)
-            if source == "env":
-                api_key = env_key if self._is_configured_api_key(env_key) else config_key
-            else:
-                api_key = config_key if self._is_configured_api_key(config_key) else env_key
+            with self._client_lock:
+                if self._client is None:
+                    config_key = self.config.get("openai_api_key", "").strip()
+                    env_key = os.getenv("OPENAI_API_KEY", "").strip()
+                    source = self._resolve_api_source(config_key)
+                    if source == "env":
+                        api_key = env_key if self._is_configured_api_key(env_key) else config_key
+                    else:
+                        api_key = config_key if self._is_configured_api_key(config_key) else env_key
 
-            if not self._is_configured_api_key(api_key):
-                raise ValueError(
-                    "API key not configured. Set OPENAI_API_KEY or save it in Settings."
-                )
-            self._client = openai.OpenAI(api_key=api_key)
+                    if not self._is_configured_api_key(api_key):
+                        raise ValueError(
+                            "API key not configured. Set OPENAI_API_KEY or save it in Settings."
+                        )
+                    self._client = openai.OpenAI(api_key=api_key)
         return self._client
 
     _MAX_PLAN_STEPS = 15
@@ -823,7 +830,8 @@ class AIAgent:
                 wait = min(wait * 2, self._RATE_LIMIT_MAX_WAIT)
 
     def _process(self, user_text: str) -> None:
-        self.history.append({"role": "user", "content": user_text})
+        with self._history_lock:
+            self.history.append({"role": "user", "content": user_text})
         self.on_status(i18n.get("ai_thinking"))
         self._progress_value = 0.0
         self._emit_progress(5, "Analizando solicitud")
@@ -851,10 +859,11 @@ class AIAgent:
                         repaired = self._repair_history()
                         if not repaired:
                             # Fallback: reset total si la reparación quirúrgica no encontró nada
-                            self.history = [
-                                {"role": "system", "content": SYSTEM_PROMPT},
-                                {"role": "user", "content": user_text},
-                            ]
+                            with self._history_lock:
+                                self.history = [
+                                    {"role": "system", "content": SYSTEM_PROMPT},
+                                    {"role": "user", "content": user_text},
+                                ]
                             self.on_message(
                                 "system",
                                 "Se reinició el contexto de la conversación por un error interno de tool-calls. Podés continuar normalmente.",
@@ -869,7 +878,8 @@ class AIAgent:
 
                 msg = response.choices[0].message
                 self._record_response_usage(getattr(response, "usage", None), model=model)
-                self.history.append(msg.to_dict())
+                with self._history_lock:
+                    self.history.append(msg.to_dict())
 
                 # Check for plan in assistant's response
                 assistant_text = msg.content or ""
@@ -894,10 +904,11 @@ class AIAgent:
                             # User confirmed — set flag to skip confirmations for next commands
                             self.awaiting_plan_confirmation = False
                             # Force immediate execution on next loop (avoid re-planning loop).
-                            self.history.append({
-                                "role": "user",
-                                "content": "Plan confirmed in UI. Execute now directly with tools and do not ask for confirmation in chat.",
-                            })
+                            with self._history_lock:
+                                self.history.append({
+                                    "role": "user",
+                                    "content": "Plan confirmed in UI. Execute now directly with tools and do not ask for confirmation in chat.",
+                                })
                         else:
                             # User cancelled — break the loop
                             self.on_message("system", "Plan cancelled by user.")
@@ -926,11 +937,12 @@ class AIAgent:
                                 "error": repr(exc),
                             })
                             result = f"Error executing tool '{tc.function.name}': {exc}"
-                        self.history.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result,
-                        })
+                        with self._history_lock:
+                            self.history.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": result,
+                            })
                     # Continue the loop so the model can process tool results
                     self._emit_progress(92, "Procesando resultados")
                     continue

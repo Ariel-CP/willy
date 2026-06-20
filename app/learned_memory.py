@@ -180,7 +180,7 @@ class LearnedMemory:
             entries.append(found)
 
         found["success_count"] = max(int(found.get("success_count", 0)), int(entry.get("success_count", 0)))
-        found["failure_count"] = min(int(found.get("failure_count", 0)), int(entry.get("failure_count", 0)))
+        found["failure_count"] = int(found.get("failure_count", 0)) + int(entry.get("failure_count", 0))
         found["last_seen"] = now
         found["confidence"] = self._confidence(found)
         data["updated_at"] = now

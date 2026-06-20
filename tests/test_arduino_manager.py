@@ -218,3 +218,24 @@ def test_sanitize_lib_deps_no_change_when_clean(tmp_path: Path) -> None:
     assert msg is None
     assert ini.read_text(encoding="utf-8") == original
 
+
+def test_sanitize_lib_deps_does_not_remove_across_sections(tmp_path: Path) -> None:
+    """La misma librería en dos secciones [env:...] distintas NO debe eliminarse."""
+    original = (
+        "[env:dev]\nplatform = atmelavr\nboard = uno\nframework = arduino\n"
+        "lib_deps =\n"
+        "    adafruit/RTClib @ ^1.14.2\n"
+        "\n"
+        "[env:prod]\nplatform = atmelavr\nboard = uno\nframework = arduino\n"
+        "lib_deps =\n"
+        "    adafruit/RTClib @ ^1.14.2\n"
+    )
+    ini = tmp_path / "platformio.ini"
+    ini.write_text(original, encoding="utf-8")
+
+    msg = ArduinoManager.sanitize_lib_deps(str(ini))
+
+    # No debe eliminar nada porque son secciones distintas
+    assert msg is None
+    assert ini.read_text(encoding="utf-8") == original
+
