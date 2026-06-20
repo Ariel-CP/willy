@@ -15,6 +15,7 @@ from typing import Callable, Optional
 
 import openai
 from app import i18n
+from app.dependency_manager import DependencyManager
 from app.flowchart_manager import FlowchartManager
 from app.iot_diagram_manager import IoTDiagramManager
 from app.security_utils import redact_sensitive_text
@@ -285,6 +286,48 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "manage_dependencies",
+            "description": "Detect, snapshot, install, update or rollback project dependencies. Supports pip, apt, npm, platformio, arduino-cli. Snapshot is always taken before install/update so rollback is available.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "One of: detect, snapshot, install, update, rollback, summary.",
+                        "enum": ["detect", "snapshot", "install", "update", "rollback", "summary"]
+                    },
+                    "ecosystem": {
+                        "type": "string",
+                        "description": "Ecosystem: pip, apt, npm, platformio, arduino-cli."
+                    },
+                    "packages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Package names for install/update."
+                    },
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to the project (needed for npm, platformio)."
+                    },
+                    "use_sudo": {
+                        "type": "boolean",
+                        "description": "Use sudo for apt commands. Only set true inside a confirmed plan.",
+                        "default": False
+                    },
+                    "policy": {
+                        "type": "string",
+                        "description": "Update policy: balanced (patch+minor) or major.",
+                        "enum": ["balanced", "major"],
+                        "default": "balanced"
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_flowchart",
             "description": "Generate a Mermaid-first flowchart from a software project and save .mmd/.svg/.png outputs.",
             "parameters": {
@@ -352,7 +395,7 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = """You are Willy, an intelligent AI assistant and IoT programming specialist fully integrated with the user's Linux (Lubuntu) terminal.
+SYSTEM_PROMPT = """You are Willy, an intelligent AI assistant specialized in mechatronics, embedded systems, and technical lab work. You are fully integrated with the user's Linux terminal in a professional electronics and programming laboratory.
 
 You have access to the following tools:
 
@@ -362,7 +405,7 @@ You have access to the following tools:
 - write_file: create or edit a file
 - list_directory: list directory contents
 - get_weather: get current weather for any city via wttr.in
-- search_web: search the internet and return relevant links
+- search_web: search the internet and return ranked results with source quality scores
 - fetch_webpage: fetch and summarize readable text from a webpage URL
 
 **IoT & Embedded Systems Tools:**
@@ -371,17 +414,27 @@ You have access to the following tools:
 - upload_microcontroller: build and upload firmware to a connected microcontroller
 - flash_sketch_file: full automatic flow from .ino to upload (prepare project + build + upload)
 - generate_iot_schematic: create an electronic schematic diagram (PNG/SVG) and BOM
+- generate_flowchart: generate a Mermaid flowchart from a project directory
+
+**Lab Domain (Mechatronics):**
+When researching or answering, apply this source priority per domain:
+- Control (PID, loops, tuning): datasheet/appnotes > GitHub maintained > community
+- Sensing (ADC, calibration, filters): datasheet > official lib > community
+- Actuation (motors, drivers, PWM): datasheet+safety > official examples > community
+- Industrial comms (CAN, Modbus, RS-485, MQTT): spec > vendor docs > maintained stack
+- Vision (camera, inference): official framework > benchmarks > community
+- Firmware/integration: PlatformIO docs > Arduino docs > community
 
 Guidelines:
 - When asked about microcontrollers (Arduino, ESP32, etc.), prefer using IoT tools (detect, build, upload).
-- When asked to design a circuit, wiring, or component diagram, use generate_iot_schematic.
+- When asked to design a circuit or wiring diagram, use generate_iot_schematic.
 - For terminal commands, use run_command. For file operations, use read_file/write_file.
-- SSH is allowed for Raspberry/system administration tasks. Prefer safe patterns like `ssh user@host 'command'` and explain what will run.
+- SSH is allowed for Raspberry/system administration tasks. Use `ssh user@host 'command'` pattern and explain what will run.
 - For commands that could be destructive (rm, sudo, overwriting files, etc.), briefly explain what you are about to do before the tool call. The UI will ask the user for confirmation.
 - SSH/SCP/RSYNC remote commands must always request confirmation before execution.
 - For read-only operations (ls, cat, pwd, search_web, fetch_webpage, detect_microcontroller, etc.) you can proceed directly.
 - Always show relevant command or tool output to the user in your response.
-- When using web data, include source URLs in your final answer.
+- **Traceability (mandatory):** When using web data, ALWAYS include: source URL, date consulted, and source quality level (official/community). Example: "Source: https://... | consulted: 2026-06-20 | quality: official_docs"
 - Be concise and helpful. Respond in the same language the user uses.
 - If a tool or command fails, analyze the error output and suggest a fix.
 
@@ -485,6 +538,7 @@ class AIAgent:
         self.environment_context_provider = environment_context_provider
         self.diagram_manager = IoTDiagramManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
         self.flowchart_manager = FlowchartManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
+        self.dep_manager = DependencyManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
         self.on_flowchart_generated = on_flowchart_generated
         self.on_usage_update = on_usage_update
         self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -817,6 +871,7 @@ class AIAgent:
             "build_microcontroller": self._tool_build_microcontroller,
             "upload_microcontroller": self._tool_upload_microcontroller,
             "flash_sketch_file": self._tool_flash_sketch_file,
+            "manage_dependencies": self._tool_manage_dependencies,
             "generate_flowchart": self._tool_generate_flowchart,
             "generate_iot_schematic": self._tool_generate_iot_schematic,
         }
@@ -996,6 +1051,37 @@ class AIAgent:
         except Exception as exc:
             return f"Error obteniendo el clima: {exc}"
 
+    # ------------------------------------------------------------------
+    # Source scoring — mechatronics-oriented priority
+    # ------------------------------------------------------------------
+
+    # (domain, hostname_fragment, bonus)
+    _SOURCE_SCORES: list[tuple[str, str, int]] = [
+        ("official_docs",    "docs.arduino.cc",          10),
+        ("official_docs",    "docs.espressif.com",       10),
+        ("official_docs",    "platformio.org",            9),
+        ("official_docs",    "micropython.org",           9),
+        ("official_docs",    "docs.python.org",           8),
+        ("official_docs",    "docs.ros.org",              9),
+        ("official_docs",    "cppreference.com",          8),
+        ("official_docs",    "modbus.org",                9),
+        ("official_docs",    "can-cia.org",               9),
+        ("github",           "github.com",                7),
+        ("community",        "stackoverflow.com",         5),
+        ("community",        "electronics.stackexchange", 5),
+        ("community",        "hackaday.com",              4),
+        ("community",        "instructables.com",         3),
+        ("community",        "reddit.com",                2),
+    ]
+
+    def _score_url(self, url: str) -> tuple[int, str]:
+        """Return (score, domain_label) for a URL. Higher is more trustworthy."""
+        lowered = (url or "").lower()
+        for domain_label, fragment, bonus in self._SOURCE_SCORES:
+            if fragment in lowered:
+                return bonus, domain_label
+        return 1, "web"
+
     def _tool_search_web(self, args: dict) -> str:
         query = args.get("query", "").strip()
         if not query:
@@ -1008,6 +1094,10 @@ class AIAgent:
             max_results = 5
         max_results = max(1, min(max_results, 10))
 
+        # Fetch more raw results so we can re-rank by source quality.
+        fetch_limit = min(max_results * 3, 30)
+        search_date = datetime.now().strftime("%Y-%m-%d")
+
         try:
             encoded_query = urllib.parse.quote_plus(query)
             url = f"https://duckduckgo.com/html/?q={encoded_query}"
@@ -1015,10 +1105,10 @@ class AIAgent:
             with urllib.request.urlopen(req, timeout=12) as resp:
                 raw_html = resp.read().decode("utf-8", errors="replace")
 
-            results: list[tuple[str, str]] = []
+            raw_results: list[tuple[str, str]] = []
             marker = 'class="result__a"'
             pos = 0
-            while len(results) < max_results:
+            while len(raw_results) < fetch_limit:
                 idx = raw_html.find(marker, pos)
                 if idx == -1:
                     break
@@ -1048,16 +1138,26 @@ class AIAgent:
                 title = html.unescape(raw_html[text_start + 1:text_end].strip())
                 clean_url = self._decode_duckduckgo_redirect(href)
                 if title and clean_url:
-                    results.append((title, clean_url))
+                    raw_results.append((title, clean_url))
 
                 pos = text_end + 4
 
-            if not results:
+            if not raw_results:
                 return f"No web results found for: {query}"
 
-            lines = [f"Web results for: {query}"]
-            for i, (title, link) in enumerate(results, start=1):
-                lines.append(f"{i}. {title}\n   URL: {link}")
+            # Re-rank: sort by source score descending, keep position as tiebreaker.
+            scored = [
+                (self._score_url(link)[0], self._score_url(link)[1], pos_idx, title, link)
+                for pos_idx, (title, link) in enumerate(raw_results)
+            ]
+            scored.sort(key=lambda x: (-x[0], x[2]))
+            top = scored[:max_results]
+
+            lines = [f"Web results for: {query}  [consulted: {search_date}]"]
+            for rank, (score, domain_label, _pos, title, link) in enumerate(top, start=1):
+                lines.append(f"{rank}. [{domain_label}] {title}")
+                lines.append(f"   URL: {link}")
+                lines.append(f"   source_quality: {score}/10  date_consulted: {search_date}")
             return "\n".join(lines)
         except Exception as exc:
             return f"Error searching web: {exc}"
@@ -1473,6 +1573,72 @@ class AIAgent:
             f"NETLIST: {result.netlist_path}",
         ]
         return "\n".join(lines)
+
+    def _tool_manage_dependencies(self, args: dict) -> str:
+        action = (args.get("action") or "").strip().lower()
+        ecosystem = (args.get("ecosystem") or "").strip().lower()
+        packages = [str(p) for p in (args.get("packages") or [])]
+        project_path = (args.get("project_path") or "").strip()
+        use_sudo = bool(args.get("use_sudo", False))
+        policy = (args.get("policy") or "balanced").strip().lower()
+
+        if project_path:
+            project_path = self._resolve_path(project_path)
+
+        if action == "detect":
+            ecosystems = self.dep_manager.detect_ecosystem(project_path or None)
+            if not ecosystems:
+                return "No ecosystems detected for this project."
+            return "Detected ecosystems: " + ", ".join(ecosystems)
+
+        if action == "summary":
+            if not ecosystem:
+                return "Error: ecosystem is required for summary."
+            return self.dep_manager.summary(ecosystem, project_path or None)
+
+        if action == "snapshot":
+            if not ecosystem:
+                return "Error: ecosystem is required for snapshot."
+            snap = self.dep_manager.snapshot(ecosystem, project_path or None)
+            if snap is None:
+                return f"Could not capture snapshot for {ecosystem}."
+            return f"Snapshot saved: {len(snap.packages)} packages in {ecosystem} at {snap.timestamp}."
+
+        if action == "install":
+            if not ecosystem:
+                return "Error: ecosystem is required for install."
+            if not packages:
+                return "Error: packages list is required for install."
+            result = self.dep_manager.install(
+                ecosystem, packages,
+                project_path=project_path or None,
+                use_sudo=use_sudo,
+            )
+            status = "OK" if result.ok else "FAILED"
+            rb = " | rollback_available: yes" if result.rollback_available else ""
+            return f"[{status}] install {ecosystem}: {result.message}{rb}"
+
+        if action == "update":
+            if not ecosystem:
+                return "Error: ecosystem is required for update."
+            result = self.dep_manager.update(
+                ecosystem, packages or None,
+                project_path=project_path or None,
+                use_sudo=use_sudo,
+                policy=policy,
+            )
+            status = "OK" if result.ok else "FAILED"
+            rb = " | rollback_available: yes" if result.rollback_available else ""
+            return f"[{status}] update {ecosystem} (policy={policy}): {result.message}{rb}"
+
+        if action == "rollback":
+            if not ecosystem:
+                return "Error: ecosystem is required for rollback."
+            result = self.dep_manager.rollback(ecosystem, project_path or None)
+            status = "OK" if result.ok else "FAILED"
+            return f"[{status}] rollback {ecosystem}: {result.message}"
+
+        return f"Error: unknown action '{action}'. Use: detect, snapshot, install, update, rollback, summary."
 
     def _tool_generate_flowchart(self, args: dict) -> str:
         project_path = self._resolve_path((args.get("project_path") or "").strip())

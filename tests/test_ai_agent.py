@@ -142,6 +142,24 @@ def test_ssh_command_always_requires_confirmation() -> None:
     assert agent._needs_confirmation("scp main.py pi@raspberrypi.local:/home/pi/") is True
 
 
+def test_score_url_prioritizes_official_docs() -> None:
+    agent = _agent()
+
+    score_arduino, label_arduino = agent._score_url("https://docs.arduino.cc/learn/microcontrollers")
+    score_reddit, label_reddit = agent._score_url("https://www.reddit.com/r/arduino/comments/xyz")
+    score_github, _ = agent._score_url("https://github.com/some-org/some-repo")
+
+    assert score_arduino > score_github > score_reddit
+    assert label_arduino == "official_docs"
+
+
+def test_score_url_unknown_domain_returns_one() -> None:
+    agent = _agent()
+    score, label = agent._score_url("https://somerandomblog.example.com/tutorial")
+    assert score == 1
+    assert label == "web"
+
+
 def test_get_client_falls_back_to_config_key_when_env_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 

@@ -569,12 +569,53 @@ class WillyApp(ctk.CTk):
             border_width=1,
             wrap="word",
         )
-        self.code_preview.grid(row=8, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self.code_preview.grid(row=8, column=0, sticky="nsew", padx=8, pady=(0, 4))
         self.code_preview.insert("0.0", "Selecciona un archivo para ver el codigo en desarrollo...")
         self.code_preview.configure(state="disabled")
 
+        # ------------------------------------------------------------------
+        # Panel de Memoria Dual
+        # ------------------------------------------------------------------
+        mem_header = ctk.CTkFrame(dashboard, fg_color="transparent")
+        mem_header.grid(row=9, column=0, sticky="ew", padx=8, pady=(4, 0))
+        mem_header.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            mem_header,
+            text="Memoria del laboratorio",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray30", "#a78bfa"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
+        self.memory_refresh_btn = ctk.CTkButton(
+            mem_header,
+            text="↺",
+            width=28,
+            height=20,
+            font=ctk.CTkFont(size=12),
+            fg_color="transparent",
+            hover_color=("gray75", "gray40"),
+            command=self._refresh_memory_panel,
+        )
+        self.memory_refresh_btn.grid(row=0, column=1, sticky="e")
+
+        self.memory_panel = ctk.CTkTextbox(
+            dashboard,
+            height=90,
+            font=ctk.CTkFont(family="monospace", size=10),
+            fg_color=("gray96", "#0a0a14"),
+            border_color=("gray65", "#a78bfa"),
+            border_width=1,
+            wrap="word",
+        )
+        self.memory_panel.grid(row=10, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.memory_panel.insert("0.0", "Sin memoria aprendida aún.")
+        self.memory_panel.configure(state="disabled")
+
         self._set_device_indicator(False)
         self._set_code_action_indicator("idle")
+        self.after(1500, self._refresh_memory_panel)
 
     # ------------------------------------------------------------------
     # Wiring
@@ -896,6 +937,30 @@ class WillyApp(ctk.CTk):
                 )
         except Exception as exc:
             self._on_system_error(str(exc), component="environment_memory")
+
+    def _refresh_memory_panel(self) -> None:
+        """Update the dual-memory panel with current global + project context."""
+        if not hasattr(self, "memory_panel"):
+            return
+        try:
+            project_path = self._resolve_project_path_for_actions()
+            text = self.learned_memory.summary_for_prompt(
+                project_path=project_path,
+                max_chars=1600,
+                project_limit=5,
+                global_limit=5,
+            )
+            display = text.strip() if text.strip() else "Sin memoria aprendida aún."
+        except Exception:
+            display = "Error al leer memoria."
+
+        def _apply() -> None:
+            self.memory_panel.configure(state="normal")
+            self.memory_panel.delete("0.0", "end")
+            self.memory_panel.insert("0.0", display)
+            self.memory_panel.configure(state="disabled")
+
+        self.after(0, _apply)
 
     def _environment_context_for_agent(self) -> str:
         try:
@@ -1221,6 +1286,7 @@ class WillyApp(ctk.CTk):
             self._on_system_error(str(exc), component="learned_memory")
 
         self.after(2200, lambda: self._set_code_action_indicator("idle"))
+        self.after(2400, self._refresh_memory_panel)
 
     def _start_upload(self) -> None:
         if self._iot_action_running:
@@ -1261,6 +1327,7 @@ class WillyApp(ctk.CTk):
             self._on_system_error(str(exc), component="learned_memory")
 
         self.after(2200, lambda: self._set_code_action_indicator("idle"))
+        self.after(2400, self._refresh_memory_panel)
 
     def _open_expanded_code_view(self) -> None:
         if self._code_expand_window is not None and self._code_expand_window.winfo_exists():
