@@ -6,8 +6,10 @@ Provides: ecosystem detection, snapshot/rollback, balanced update policy.
 
 from __future__ import annotations
 
+import configparser
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -132,13 +134,7 @@ class DependencyManager:
                 except Exception:
                     pass
         elif ecosystem == "platformio" and project_path:
-            rc, out, _ = _run(["pio", "lib", "list", "--json-output"], cwd=project_path, timeout=30)
-            if rc == 0:
-                try:
-                    for lib in json.loads(out):
-                        packages[lib.get("name", "?")] = lib.get("version", "?")
-                except Exception:
-                    pass
+            packages = self._pio_read_lib_deps(Path(project_path) / "platformio.ini")
 
         if not packages:
             return None
@@ -175,7 +171,25 @@ class DependencyManager:
         elif ecosystem == "npm" and project_path:
             cmd = ["npm", "install"] + packages
         elif ecosystem == "platformio" and project_path:
-            cmd = ["pio", "lib", "install"] + packages
+            ini_path = Path(project_path) / "platformio.ini"
+            if not ini_path.exists():
+                return DepResult(ok=False, ecosystem=ecosystem, action="install",
+                                 message="platformio.ini not found in project path.")
+            ok_add, msg_add = self._pio_append_lib_deps(ini_path, packages)
+            if not ok_add:
+                return DepResult(ok=False, ecosystem=ecosystem, action="install",
+                                 message=msg_add)
+            rc, out, err = _run(["pio", "pkg", "install"], cwd=project_path, timeout=120)
+            ok = rc == 0
+            detail = (out or err or ("OK" if ok else "Failed"))[:800]
+            return DepResult(
+                ok=ok,
+                ecosystem=ecosystem,
+                action="install",
+                message=f"{msg_add} | pio pkg install: {detail}",
+                packages_affected=packages,
+                rollback_available=True,
+            )
         elif ecosystem == "arduino-cli":
             cmd = ["arduino-cli", "lib", "install"] + packages
         else:
@@ -228,7 +242,11 @@ class DependencyManager:
             else:
                 cmd = ["npm", "update"]
         elif ecosystem == "platformio" and project_path:
-            cmd = ["pio", "lib", "update"]
+            rc, out, err = _run(["pio", "pkg", "update"], cwd=project_path, timeout=180)
+            ok = rc == 0
+            msg = (out or err or ("OK" if ok else "Failed"))[:1200]
+            return DepResult(ok=ok, ecosystem=ecosystem, action="update",
+                             message=msg, rollback_available=True)
         elif ecosystem == "arduino-cli":
             cmd = ["arduino-cli", "lib", "upgrade"]
         else:
@@ -263,6 +281,24 @@ class DependencyManager:
             ok = rc == 0
             return DepResult(ok=ok, ecosystem=ecosystem, action="rollback",
                              message=(out or err or "OK")[:1200],
+                             packages_affected=list(snap.packages.keys()))
+
+        if ecosystem == "platformio":
+            if not project_path:
+                return DepResult(ok=False, ecosystem=ecosystem, action="rollback",
+                                 message="project_path is required for PlatformIO rollback.")
+            ini_path = Path(project_path) / "platformio.ini"
+            if not ini_path.exists():
+                return DepResult(ok=False, ecosystem=ecosystem, action="rollback",
+                                 message="platformio.ini not found.")
+            ok_r, msg_r = self._pio_restore_lib_deps(ini_path, snap.packages)
+            if not ok_r:
+                return DepResult(ok=False, ecosystem=ecosystem, action="rollback", message=msg_r)
+            rc, out, err = _run(["pio", "pkg", "install"], cwd=project_path, timeout=120)
+            ok = rc == 0
+            detail = (out or err or ("OK" if ok else "Failed"))[:800]
+            return DepResult(ok=ok, ecosystem=ecosystem, action="rollback",
+                             message=f"{msg_r} | pio pkg install: {detail}",
                              packages_affected=list(snap.packages.keys()))
 
         return DepResult(ok=False, ecosystem=ecosystem, action="rollback",
@@ -300,6 +336,129 @@ class DependencyManager:
                 continue
             targets.append(item["name"])
         return targets
+
+    # -----------------------------------------------------------------------
+    # PlatformIO helpers
+    # -----------------------------------------------------------------------
+
+    def _pio_read_lib_deps(self, ini_path: Path) -> dict[str, str]:
+        """Lee todas las entradas de lib_deps de platformio.ini.
+
+        Retorna {lib_entry: 'declared'} para cada línea no vacía.
+        """
+        if not ini_path.exists():
+            return {}
+        try:
+            cfg = configparser.RawConfigParser()
+            cfg.read(str(ini_path), encoding="utf-8")
+            packages: dict[str, str] = {}
+            for section in cfg.sections():
+                raw = cfg.get(section, "lib_deps", fallback="")
+                for line in raw.splitlines():
+                    lib = line.strip()
+                    if lib and not lib.startswith(("#", ";")):
+                        packages[lib] = "declared"
+            return packages
+        except Exception:
+            return {}
+
+    def _pio_append_lib_deps(self, ini_path: Path, packages: list[str]) -> tuple[bool, str]:
+        """Agrega packages al bloque lib_deps de platformio.ini evitando duplicados.
+
+        Retorna (ok, mensaje).
+        """
+        def _base(entry: str) -> str:
+            entry = re.split(r"\s*[;#]", entry.strip())[0].strip()
+            name = re.split(r"\s*@", entry)[0].strip()
+            if "/" in name:
+                name = name.split("/", 1)[1]
+            return name.strip().lower()
+
+        try:
+            content = ini_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return False, str(exc)
+
+        lines = content.splitlines(keepends=True)
+        existing: set[str] = set()
+        in_lib_deps = False
+        insert_at: int | None = None
+
+        for i, line in enumerate(lines):
+            stripped = line.rstrip()
+            if re.match(r"^\s*lib_deps\s*=", stripped):
+                in_lib_deps = True
+                inline = re.sub(r"^\s*lib_deps\s*=\s*", "", stripped).strip()
+                if inline:
+                    existing.add(_base(inline))
+                continue
+            if in_lib_deps:
+                if stripped and not stripped.startswith((" ", "\t")):
+                    insert_at = i
+                    in_lib_deps = False
+                    break
+                entry = stripped.strip()
+                if entry:
+                    existing.add(_base(entry))
+
+        if in_lib_deps:
+            insert_at = len(lines)  # lib_deps al final del archivo
+
+        if insert_at is None:
+            return False, "No lib_deps block found in platformio.ini. Add lib_deps to the [env:...] section first."
+
+        to_add = [p for p in packages if _base(p) not in existing]
+        if not to_add:
+            return True, "All packages already declared in lib_deps."
+
+        additions = [f"    {pkg}\n" for pkg in to_add]
+        new_lines = lines[:insert_at] + additions + lines[insert_at:]
+        try:
+            ini_path.write_text("".join(new_lines), encoding="utf-8")
+            return True, f"Added to lib_deps: {', '.join(to_add)}"
+        except OSError as exc:
+            return False, str(exc)
+
+    def _pio_restore_lib_deps(self, ini_path: Path, saved: dict[str, str]) -> tuple[bool, str]:
+        """Reemplaza el bloque lib_deps en platformio.ini con las entradas del snapshot.
+
+        Retorna (ok, mensaje).
+        """
+        try:
+            content = ini_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return False, str(exc)
+
+        libs = [k for k in saved if k and not k.startswith(("#", ";"))]
+        lines = content.splitlines(keepends=True)
+        new_lines: list[str] = []
+        in_lib_deps = False
+        restored = False
+
+        for line in lines:
+            stripped = line.rstrip()
+            if re.match(r"^\s*lib_deps\s*=", stripped):
+                in_lib_deps = True
+                new_lines.append("lib_deps =\n")
+                for lib in libs:
+                    new_lines.append(f"    {lib}\n")
+                restored = True
+                continue
+            if in_lib_deps:
+                if not stripped or (stripped and not stripped.startswith((" ", "\t"))):
+                    in_lib_deps = False
+                    new_lines.append(line)
+                # else: omitir línea de continuación antigua
+                continue
+            new_lines.append(line)
+
+        if not restored:
+            return False, "No lib_deps block found to restore."
+        try:
+            ini_path.write_text("".join(new_lines), encoding="utf-8")
+            return True, f"Restored {len(libs)} packages to lib_deps."
+        except OSError as exc:
+            return False, str(exc)
 
     def _snapshot_path(self, project_path: str | None) -> Path:
         base = Path(project_path) if project_path else self.base_dir

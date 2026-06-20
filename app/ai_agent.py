@@ -1769,6 +1769,8 @@ class AIAgent:
             return self._tool_sanitize_pio_ini(project_path or ".")
 
         return f"Error: unknown action '{action}'. Use: detect, snapshot, install, update, rollback, summary, sanitize_pio."
+
+    def _tool_sanitize_pio_ini(self, project_path: str) -> str:
         """Deduplica lib_deps en platformio.ini del proyecto dado."""
         if not self.arduino_manager:
             return "Error: Arduino support not available."
