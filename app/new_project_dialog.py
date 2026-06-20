@@ -79,12 +79,15 @@ def _detect_drives() -> list[tuple[str, str, str]]:
 TEMPLATES: dict[str, dict] = {
     "Vacío": {
         "description": "Solo la carpeta del proyecto.",
-        "files": [],
+        "files": [
+            ("diagrams/.gitkeep", ""),
+        ],
     },
     "Arduino (.ino)": {
         "description": "Sketch básico de Arduino IDE.",
         "files": [
             ("{name}/{name}.ino", "void setup() {{\n  // inicialización\n}}\n\nvoid loop() {{\n  // lógica principal\n}}\n"),
+            ("diagrams/.gitkeep", ""),
         ],
     },
     "PlatformIO": {
@@ -95,6 +98,7 @@ TEMPLATES: dict[str, dict] = {
             ("include/README", "Put project header files here.\n"),
             ("lib/README", "Put project libraries here.\n"),
             ("test/README", "Put project tests here.\n"),
+            ("diagrams/.gitkeep", ""),
         ],
     },
     "Python": {
@@ -102,6 +106,7 @@ TEMPLATES: dict[str, dict] = {
         "files": [
             ("main.py", "# Proyecto: {name}\n\ndef main():\n    pass\n\nif __name__ == '__main__':\n    main()\n"),
             ("requirements.txt", "# dependencias\n"),
+            ("diagrams/.gitkeep", ""),
         ],
     },
 }

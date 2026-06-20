@@ -388,6 +388,10 @@ TOOLS = [
                             },
                         },
                     },
+                    "project_path": {
+                        "type": "string",
+                        "description": "Absolute path of the active project directory. If provided, diagrams are also saved inside {project_path}/diagrams/.",
+                    },
                 },
                 "required": ["title", "board", "components"],
             },
@@ -1540,6 +1544,7 @@ class AIAgent:
         board = (args.get("board") or "esp32").strip()
         components = args.get("components") or []
         connections = args.get("connections") or []
+        project_path = self._resolve_path((args.get("project_path") or "").strip())
 
         if not isinstance(components, list) or not components:
             return "Error: components must be a non-empty array."
@@ -1551,6 +1556,7 @@ class AIAgent:
             board=board,
             components=components,
             connections=connections,
+            project_path=project_path,
         )
 
         if not result.ok:

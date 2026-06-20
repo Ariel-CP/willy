@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import os
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -33,6 +34,7 @@ class IoTDiagramManager:
         board: str,
         components: list[dict[str, Any]],
         connections: list[dict[str, Any]],
+        project_path: str = "",
     ) -> DiagramResult:
         if not components:
             return DiagramResult(False, "No components provided.")
@@ -75,6 +77,31 @@ class IoTDiagramManager:
         except Exception as exc:  # noqa: BLE001
             return DiagramResult(False, f"Failed to generate schematic: {exc}")
 
+        # --- Copia al directorio del proyecto (si se proporcionó) ---
+        project_svg = svg_path
+        project_png = png_path
+        project_bom = bom_path
+        project_net = netlist_path
+        if project_path and os.path.isdir(project_path):
+            proj_diag_dir = os.path.join(project_path, "diagrams")
+            os.makedirs(proj_diag_dir, exist_ok=True)
+            try:
+                project_svg = os.path.join(proj_diag_dir, f"{base_name}.svg")
+                shutil.copy2(svg_path, project_svg)
+                if png_path and os.path.isfile(png_path):
+                    project_png = os.path.join(proj_diag_dir, f"{base_name}.png")
+                    shutil.copy2(png_path, project_png)
+                project_bom = os.path.join(proj_diag_dir, f"{base_name}_bom.csv")
+                shutil.copy2(bom_path, project_bom)
+                project_net = os.path.join(proj_diag_dir, f"{base_name}.net")
+                shutil.copy2(netlist_path, project_net)
+            except OSError:
+                # Si falla la copia, seguimos usando los paths globales
+                project_svg = svg_path
+                project_png = png_path
+                project_bom = bom_path
+                project_net = netlist_path
+
         message = "Schematic generated successfully."
         if warnings:
             shown = warnings[:6]
@@ -86,10 +113,10 @@ class IoTDiagramManager:
         return DiagramResult(
             ok=True,
             message=message,
-            png_path=png_path,
-            svg_path=svg_path,
-            bom_path=bom_path,
-            netlist_path=netlist_path,
+            png_path=project_png,
+            svg_path=project_svg,
+            bom_path=project_bom,
+            netlist_path=project_net,
         )
 
     def _draw_schematic(

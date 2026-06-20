@@ -1738,31 +1738,34 @@ class WillyApp(ctk.CTk):
         latest_svg = ""
         latest_bom = ""
 
-        try:
-            if os.path.isdir(schem_dir):
-                svgs = [
-                    os.path.join(schem_dir, name)
-                    for name in os.listdir(schem_dir)
-                    if name.lower().endswith(".svg")
-                ]
-                session_svgs = [
-                    path for path in svgs
-                    if os.path.getmtime(path) >= (self._app_session_start_ts - 1.0)
-                ]
-                if session_svgs:
-                    latest_svg = max(session_svgs, key=os.path.getmtime)
+        # Directorios a escanear: global + carpeta diagrams/ del proyecto activo
+        scan_dirs = [schem_dir]
+        active_project = self._resolve_project_path_for_actions()
+        if active_project:
+            proj_diag = os.path.join(os.path.dirname(active_project), "diagrams")
+            if os.path.isdir(proj_diag) and proj_diag not in scan_dirs:
+                scan_dirs.append(proj_diag)
 
-                boms = [
-                    os.path.join(schem_dir, name)
-                    for name in os.listdir(schem_dir)
-                    if name.lower().endswith("_bom.csv")
-                ]
-                session_boms = [
-                    path for path in boms
-                    if os.path.getmtime(path) >= (self._app_session_start_ts - 1.0)
-                ]
-                if session_boms:
-                    latest_bom = max(session_boms, key=os.path.getmtime)
+        try:
+            all_svgs: list[str] = []
+            all_boms: list[str] = []
+            for d in scan_dirs:
+                if not os.path.isdir(d):
+                    continue
+                for name in os.listdir(d):
+                    full = os.path.join(d, name)
+                    if name.lower().endswith(".svg"):
+                        all_svgs.append(full)
+                    elif name.lower().endswith("_bom.csv"):
+                        all_boms.append(full)
+
+            session_svgs = [p for p in all_svgs if os.path.getmtime(p) >= (self._app_session_start_ts - 1.0)]
+            if session_svgs:
+                latest_svg = max(session_svgs, key=os.path.getmtime)
+
+            session_boms = [p for p in all_boms if os.path.getmtime(p) >= (self._app_session_start_ts - 1.0)]
+            if session_boms:
+                latest_bom = max(session_boms, key=os.path.getmtime)
         except Exception:
             latest_svg = ""
             latest_bom = ""
