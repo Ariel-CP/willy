@@ -99,6 +99,8 @@ class WillyApp(ctk.CTk):
         self._layout_reflow_job = None
         self._last_layout_signature = None
         self._startup_diag_running = False
+        self._session_errors: list[dict] = []
+        self._error_log_window = None
 
         self._build_layout()
         self._wire_up()
@@ -261,6 +263,19 @@ class WillyApp(ctk.CTk):
             hover_color=("gray70", "gray30"),
             command=self._open_settings,
         ).grid(row=0, column=4, padx=(0, 4))
+
+        self.error_log_btn = ctk.CTkButton(
+            status_bar,
+            text="⚠ Sin errores",
+            width=100,
+            height=18,
+            font=ctk.CTkFont(size=10),
+            fg_color="transparent",
+            hover_color=("gray70", "gray30"),
+            text_color=("gray55", "gray55"),
+            command=self._open_error_log,
+        )
+        self.error_log_btn.grid(row=0, column=5, padx=(0, 6))
 
     def _build_iot_dashboard(self, parent) -> None:
         dashboard = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
@@ -786,6 +801,7 @@ class WillyApp(ctk.CTk):
         self.session_logger.log_message(role, text)
         if role == "error":
             self.session_logger.log_error("ai_agent", text)
+            self._record_error("ai_agent", text)
         if not hasattr(self, "clippy") or self.clippy is None:
             return
         # Reacciones suaves para un asistente amigable orientado a adultos mayores.
@@ -1054,6 +1070,201 @@ class WillyApp(ctk.CTk):
 
     def _on_system_error(self, message: str, component: str = "system") -> None:
         self.session_logger.log_error(component, message)
+        self._record_error(component, message)
+
+    def _record_error(self, component: str, message: str) -> None:
+        """Acumula un error en memoria y actualiza el badge de la barra de estado."""
+        from datetime import datetime as _dt
+        entry = {
+            "timestamp": _dt.now().strftime("%H:%M:%S"),
+            "component": component,
+            "message": message,
+        }
+        self._session_errors.append(entry)
+        self.after(0, self._update_error_badge)
+        # Refrescar ventana si está abierta
+        self.after(0, self._refresh_error_log_if_open)
+
+    def _update_error_badge(self) -> None:
+        if not hasattr(self, "error_log_btn"):
+            return
+        n = len(self._session_errors)
+        if n == 0:
+            self.error_log_btn.configure(
+                text="⚠ Sin errores",
+                text_color=("gray55", "gray55"),
+            )
+        elif n < 5:
+            self.error_log_btn.configure(
+                text=f"⚠ {n} error{'es' if n > 1 else ''}",
+                text_color=("#b45309", "#f59e0b"),
+            )
+        else:
+            self.error_log_btn.configure(
+                text=f"⚠ {n} errores",
+                text_color=("#dc2626", "#ef4444"),
+            )
+
+    def _open_error_log(self) -> None:
+        """Abre (o trae al frente) la ventana de log de errores de la sesión."""
+        if self._error_log_window is not None and self._error_log_window.winfo_exists():
+            self._error_log_window.lift()
+            self._refresh_error_log_if_open()
+            return
+
+        win = ctk.CTkToplevel(self)
+        win.title("Log de errores — sesión actual")
+        win.geometry("720x460")
+        win.resizable(True, True)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+        self._error_log_window = win
+
+        # --- Encabezado ---
+        header = ctk.CTkFrame(win, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        header.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            header,
+            text="Errores capturados en esta sesión",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
+        self._error_count_label = ctk.CTkLabel(
+            header,
+            text="",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray45", "gray65"),
+            anchor="e",
+        )
+        self._error_count_label.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        # --- Área de texto ---
+        self._error_log_text = ctk.CTkTextbox(
+            win,
+            font=ctk.CTkFont(family="monospace", size=11),
+            fg_color=("gray96", "#0d1117"),
+            border_color=("gray65", "#ef4444"),
+            border_width=1,
+            wrap="word",
+        )
+        self._error_log_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 4))
+
+        # --- Botones ---
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+
+        ctk.CTkButton(
+            btn_row,
+            text="Exportar .txt",
+            width=110,
+            fg_color=("#2563eb", "#1d4ed8"),
+            hover_color=("#1d4ed8", "#1e40af"),
+            command=self._export_error_log,
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_row,
+            text="Abrir diagnósticos",
+            width=130,
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=self._open_diagnostics_file,
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_row,
+            text="Limpiar",
+            width=80,
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=self._clear_error_log,
+        ).pack(side="left")
+
+        win.after(100, lambda: self._safe_grab_toplevel(win))
+        self._refresh_error_log_if_open()
+
+    def _safe_grab_toplevel(self, win) -> None:
+        try:
+            if win.winfo_exists():
+                win.grab_set()
+        except Exception:
+            pass
+
+    def _refresh_error_log_if_open(self) -> None:
+        if (
+            self._error_log_window is None
+            or not self._error_log_window.winfo_exists()
+        ):
+            return
+        if not hasattr(self, "_error_log_text"):
+            return
+
+        n = len(self._session_errors)
+        self._error_count_label.configure(
+            text=f"{n} error{'es' if n != 1 else ''} en esta sesión"
+        )
+
+        self._error_log_text.configure(state="normal")
+        self._error_log_text.delete("0.0", "end")
+
+        if not self._session_errors:
+            self._error_log_text.insert("0.0", "No hay errores registrados en esta sesión.")
+        else:
+            lines = []
+            for i, e in enumerate(self._session_errors, 1):
+                lines.append(
+                    f"[{e['timestamp']}] [{e['component'].upper()}]\n{e['message']}\n"
+                    + "─" * 60
+                )
+            self._error_log_text.insert("0.0", "\n".join(lines))
+            # Auto-scroll al último error
+            self._error_log_text.see("end")
+
+        self._error_log_text.configure(state="disabled")
+
+    def _export_error_log(self) -> None:
+        from tkinter import filedialog as _fd
+        from datetime import datetime as _dt
+        default_name = f"errores_{_dt.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+        sessions_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sessions")
+        path = _fd.asksaveasfilename(
+            parent=self._error_log_window,
+            title="Exportar log de errores",
+            initialdir=sessions_dir,
+            initialfile=default_name,
+            defaultextension=".txt",
+            filetypes=[("Texto", "*.txt"), ("Todos", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f"Log de errores — sesión {_dt.now().isoformat()}\n")
+                fh.write("=" * 60 + "\n\n")
+                for e in self._session_errors:
+                    fh.write(f"[{e['timestamp']}] [{e['component'].upper()}]\n{e['message']}\n\n")
+        except OSError as exc:
+            from tkinter import messagebox as _mb
+            _mb.showerror("Error al exportar", str(exc), parent=self._error_log_window)
+
+    def _open_diagnostics_file(self) -> None:
+        import webbrowser as _wb
+        try:
+            path = self.session_logger.diagnostics_path
+            if os.path.isfile(path):
+                _wb.open(f"file://{path}")
+        except Exception:
+            pass
+
+    def _clear_error_log(self) -> None:
+        self._session_errors.clear()
+        self._update_error_badge()
+        self._refresh_error_log_if_open()
+
+
 
     def _on_file_selected(self, path: str) -> None:
         self._current_code_path = path
