@@ -775,6 +775,52 @@ class AIAgent:
         
         return confirmed
 
+    _RATE_LIMIT_MAX_RETRIES = 4
+    _RATE_LIMIT_BASE_WAIT = 5   # segundos
+    _RATE_LIMIT_MAX_WAIT = 120  # segundos
+
+    def _api_call_with_retry(self, client, model: str):
+        """
+        Llama a client.chat.completions.create con reintentos automáticos
+        ante errores de rate limit (429), usando backoff exponencial.
+        Respeta el header Retry-After cuando OpenAI lo devuelve.
+        """
+        wait = self._RATE_LIMIT_BASE_WAIT
+        for attempt in range(self._RATE_LIMIT_MAX_RETRIES + 1):
+            try:
+                return client.chat.completions.create(
+                    model=model,
+                    messages=self._build_request_messages(),
+                    tools=TOOLS,
+                    tool_choice="auto",
+                )
+            except openai.RateLimitError as exc:
+                if attempt >= self._RATE_LIMIT_MAX_RETRIES:
+                    raise  # Se agotaron los reintentos
+
+                # Intentar leer Retry-After del header HTTP
+                retry_after = None
+                try:
+                    retry_after = int(
+                        exc.response.headers.get("retry-after", 0)  # type: ignore[union-attr]
+                    )
+                except Exception:
+                    pass
+
+                actual_wait = max(wait, retry_after or 0)
+                actual_wait = min(actual_wait, self._RATE_LIMIT_MAX_WAIT)
+
+                self.on_status(
+                    f"Rate limit — reintentando en {actual_wait}s "
+                    f"(intento {attempt + 1}/{self._RATE_LIMIT_MAX_RETRIES})"
+                )
+                self._log_event("rate_limit_retry", {
+                    "attempt": attempt + 1,
+                    "wait_seconds": actual_wait,
+                })
+                time.sleep(actual_wait)
+                wait = min(wait * 2, self._RATE_LIMIT_MAX_WAIT)
+
     def _process(self, user_text: str) -> None:
         self.history.append({"role": "user", "content": user_text})
         self.on_status(i18n.get("ai_thinking"))
@@ -788,12 +834,7 @@ class AIAgent:
             while True:
                 self._emit_progress(12, "Consultando modelo")
                 try:
-                    response = client.chat.completions.create(
-                        model=model,
-                        messages=self._build_request_messages(),
-                        tools=TOOLS,
-                        tool_choice="auto",
-                    )
+                    response = self._api_call_with_retry(client, model)
                 except openai.BadRequestError as exc:
                     err_text = str(exc)
                     self._log_event("bad_request", {
@@ -906,7 +947,11 @@ class AIAgent:
             self.on_message("error", "Invalid API key. Please check config.json.")
             self._emit_progress(100, "Completado con error")
         except openai.RateLimitError:
-            self.on_message("error", "Rate limit reached. Please wait a moment.")
+            self.on_message(
+                "error",
+                f"Rate limit de OpenAI alcanzado. Se reintentó {self._RATE_LIMIT_MAX_RETRIES} "
+                "veces sin éxito. Esperá unos minutos e intentá de nuevo.",
+            )
             self._emit_progress(100, "Completado con error")
         except Exception as exc:  # noqa: BLE001
             self.on_message("error", f"Unexpected error: {exc}")
