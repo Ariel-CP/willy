@@ -1378,6 +1378,27 @@ class WillyApp(ctk.CTk):
     def _on_ai_file_written(self, path: str, content: str) -> None:
         # Called from agent worker thread; marshal to UI thread.
         self.after(0, self._update_code_preview_from_content, path, content)
+        # Auto-generate flowchart for .ino sketches
+        if path.lower().endswith(".ino"):
+            self.after(200, self._auto_flowchart_from_ino, path)
+
+    def _auto_flowchart_from_ino(self, ino_path: str) -> None:
+        """Generate and display an Arduino flowchart when a .ino file is written."""
+        import threading
+        title = os.path.splitext(os.path.basename(ino_path))[0]
+
+        def _run() -> None:
+            try:
+                from app.flowchart_manager import FlowchartManager
+                fm = FlowchartManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
+                result = fm.generate_from_ino_sketch(ino_path, title=title)
+                if result.ok:
+                    display = result.svg_path or result.png_path or result.mmd_path
+                    self.after(0, self._apply_generated_flowchart, display, result.mmd_path)
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True, name="auto-flowchart").start()
 
     def _update_code_preview_from_content(self, path: str, content: str) -> None:
         self._current_code_path = path

@@ -89,6 +89,168 @@ class FlowchartManager:
             png_path=png_path if png_ready else "",
         )
 
+    def generate_from_ino_sketch(self, sketch_path: str, title: str = "") -> FlowchartResult:
+        """Generate an Arduino-specific flowchart from a .ino sketch file.
+
+        Shows Power-On → setup() → loop() with the actual function calls inside each.
+        """
+        ino_abs = os.path.abspath(sketch_path)
+        if not os.path.isfile(ino_abs):
+            return FlowchartResult(ok=False, message=f"Sketch not found: {ino_abs}")
+
+        sketch_dir = os.path.dirname(ino_abs)
+        flow_dir = os.path.join(self.base_dir, "outputs", "flows")
+        os.makedirs(flow_dir, exist_ok=True)
+
+        display_title = (title or os.path.splitext(os.path.basename(ino_abs))[0]).strip()
+        safe_title = self._safe_name(display_title)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = f"{safe_title}_{stamp}"
+
+        mmd_path = os.path.join(flow_dir, f"{base_name}.mmd")
+        svg_path = os.path.join(flow_dir, f"{base_name}.svg")
+        png_path = os.path.join(flow_dir, f"{base_name}.png")
+
+        try:
+            with open(ino_abs, "r", encoding="utf-8", errors="replace") as fh:
+                source = fh.read()
+        except Exception as exc:
+            return FlowchartResult(ok=False, message=f"Cannot read sketch: {exc}")
+
+        flow = self._parse_arduino_flow(source)
+        mermaid = self._build_arduino_mermaid(display_title, flow)
+
+        try:
+            with open(mmd_path, "w", encoding="utf-8") as fh:
+                fh.write(mermaid)
+        except Exception as exc:
+            return FlowchartResult(ok=False, message=f"Cannot write .mmd: {exc}")
+
+        # Build a minimal outline for the SVG fallback renderer
+        outline = {
+            "files": [os.path.basename(ino_abs)],
+            "file_functions": {os.path.basename(ino_abs): flow.get("all_funcs", [])},
+        }
+        render_msg, svg_ready, png_ready = self._render_if_available(
+            mmd_path, svg_path, png_path, display_title, outline
+        )
+
+        return FlowchartResult(
+            ok=True,
+            message=render_msg,
+            project_path=sketch_dir,
+            mmd_path=mmd_path,
+            svg_path=svg_path if svg_ready else "",
+            png_path=png_path if png_ready else "",
+        )
+
+    # ------------------------------------------------------------------
+    # Arduino-specific parser
+    # ------------------------------------------------------------------
+
+    def _parse_arduino_flow(self, source: str) -> dict:
+        """Extract setup/loop bodies and user-defined function names from .ino source."""
+        # Strip line and block comments
+        source_clean = re.sub(r"//[^\n]*", "", source)
+        source_clean = re.sub(r"/\*.*?\*/", "", source_clean, flags=re.DOTALL)
+
+        def _extract_body(name: str) -> list[str]:
+            """Return list of statement lines from the body of a top-level function."""
+            pattern = rf"void\s+{re.escape(name)}\s*\(\s*\)\s*\{{"
+            m = re.search(pattern, source_clean)
+            if not m:
+                return []
+            start = m.end()
+            depth = 1
+            i = start
+            while i < len(source_clean) and depth:
+                if source_clean[i] == "{":
+                    depth += 1
+                elif source_clean[i] == "}":
+                    depth -= 1
+                i += 1
+            body = source_clean[start : i - 1]
+            # Extract meaningful statements: function calls and assignments
+            calls: list[str] = []
+            for line in body.splitlines():
+                line = line.strip().rstrip(";")
+                if not line or line in ("{", "}"):
+                    continue
+                # Skip pure declarations (type name;)
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_:<>*&\s]+\s+[A-Za-z_]\w*$", line):
+                    continue
+                calls.append(line[:60])
+            return calls[:8]
+
+        # All user-defined function names (void and non-void)
+        all_funcs = re.findall(
+            r"^\s*(?:void|int|bool|float|double|long|unsigned|String|byte|char)\s+([A-Za-z_]\w*)\s*\(",
+            source_clean,
+            re.MULTILINE,
+        )
+        # Exclude setup/loop and built-in-ish names
+        user_funcs = [f for f in dict.fromkeys(all_funcs)
+                      if f not in ("setup", "loop", "main", "Serial")]
+
+        return {
+            "setup": _extract_body("setup"),
+            "loop": _extract_body("loop"),
+            "user_funcs": user_funcs[:6],
+            "all_funcs": [f for f in dict.fromkeys(all_funcs)][:8],
+            "includes": re.findall(r'#include\s*[<"]([^>"]+)[>"]', source),
+        }
+
+    def _build_arduino_mermaid(self, title: str, flow: dict) -> str:
+        """Build a Mermaid flowchart showing Arduino setup/loop flow."""
+        setup_calls: list[str] = flow.get("setup", [])
+        loop_calls: list[str] = flow.get("loop", [])
+        includes: list[str] = flow.get("includes", [])
+
+        def _node_id(prefix: str, idx: int) -> str:
+            return f"{prefix}{idx}"
+
+        def _label(text: str) -> str:
+            # Escape quotes and Mermaid special chars
+            return text.replace('"', "'").replace("[", "(").replace("]", ")")
+
+        lines: list[str] = ["flowchart TD"]
+
+        # Header nodes
+        lines.append(f'    START(["⚡ Power On / Reset"])')
+        if includes:
+            lib_list = ", ".join(includes[:4])
+            lines.append(f'    LIBS["📚 Libraries: {_label(lib_list)}"]')
+            lines.append("    START --> LIBS --> SETUP")
+        else:
+            lines.append("    START --> SETUP")
+
+        lines.append(f'    SETUP["🔧 setup()"]')
+
+        # setup() body nodes
+        prev = "SETUP"
+        for i, stmt in enumerate(setup_calls):
+            nid = _node_id("S", i)
+            lines.append(f'    {nid}["{_label(stmt)}"]')
+            lines.append(f"    {prev} --> {nid}")
+            prev = nid
+
+        # Transition to loop
+        lines.append(f'    LOOP{{"🔁 loop()"}}')
+        lines.append(f"    {prev} --> LOOP")
+
+        # loop() body nodes
+        prev_loop = "LOOP"
+        for i, stmt in enumerate(loop_calls):
+            nid = _node_id("L", i)
+            lines.append(f'    {nid}["{_label(stmt)}"]')
+            lines.append(f"    {prev_loop} --> {nid}")
+            prev_loop = nid
+
+        # Loop back arrow
+        lines.append(f"    {prev_loop} --> LOOP")
+
+        return "\n".join(lines) + "\n"
+
     def _collect_project_outline(self, project_path: str) -> dict:
         files: list[str] = []
         file_functions: dict[str, list[str]] = {}
