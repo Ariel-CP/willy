@@ -102,7 +102,11 @@ class DependencyManager:
             ecosystems.append("pip")
         if _which("apt"):
             ecosystems.append("apt")
-        if _which("arduino-cli"):
+        if _which("arduino-cli") and proj and any(proj.glob("*.ino")):
+            # Proyecto Arduino IDE nativo (contiene .ino)
+            ecosystems.append("arduino-cli")
+        elif _which("arduino-cli"):
+            ecosystems.append("arduino-cli")
             ecosystems.append("arduino-cli")
         return ecosystems
 

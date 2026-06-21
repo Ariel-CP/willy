@@ -252,6 +252,44 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "build_upload_ino",
+            "description": (
+                "Compile and upload a .ino sketch natively with arduino-cli — no PlatformIO conversion needed. "
+                "Use for pure Arduino IDE projects. Detects port and board automatically if not provided. "
+                "Preferred over flash_sketch_file when the project has no platformio.ini."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sketch_path": {
+                        "type": "string",
+                        "description": "Path to the .ino file or its parent folder.",
+                    },
+                    "fqbn": {
+                        "type": "string",
+                        "description": (
+                            "Fully Qualified Board Name, e.g. 'arduino:avr:uno', "
+                            "'arduino:avr:nano', 'esp32:esp32:esp32dev'. "
+                            "Omit to auto-detect from connected board."
+                        ),
+                    },
+                    "port": {
+                        "type": "string",
+                        "description": "Serial port, e.g. /dev/ttyUSB0. Omit to auto-detect.",
+                    },
+                    "compile_only": {
+                        "type": "boolean",
+                        "description": "If true, only compile (no upload). Default false.",
+                        "default": False,
+                    },
+                },
+                "required": ["sketch_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "flash_sketch_file",
             "description": "End-to-end flow: prepare PlatformIO project from an .ino file, compile, and upload to detected microcontroller.",
             "parameters": {
@@ -416,7 +454,8 @@ You have access to the following tools:
 - detect_microcontroller: detect connected Arduino, ESP32, or other microcontroller boards
 - build_microcontroller: compile Arduino/ESP32 projects using PlatformIO
 - upload_microcontroller: build and upload firmware to a connected microcontroller
-- flash_sketch_file: full automatic flow from .ino to upload (prepare project + build + upload)
+- flash_sketch_file: full automatic flow from .ino to upload via PlatformIO (prepare project + build + upload)
+- build_upload_ino: compile and upload a .ino sketch natively with arduino-cli (no PlatformIO conversion)
 - generate_iot_schematic: create an electronic schematic diagram (PNG/SVG) and BOM
 - generate_flowchart: generate a Mermaid flowchart from a project directory
 
@@ -442,6 +481,11 @@ Guidelines:
 - Be concise and helpful. Respond in the same language the user uses.
 - If a tool or command fails, analyze the error output and suggest a fix.
 - **platformio.ini rule:** ALWAYS use `read_file` to inspect the current content of `platformio.ini` BEFORE writing it. When modifying `lib_deps`, write the COMPLETE replacement block — never append to existing entries. Duplicate lib_deps entries (same library, different owner) cause build failures. If you detect a build error caused by an unknown package, use `manage_dependencies` with action `sanitize_pio` to auto-clean duplicates. After adding or modifying `lib_deps`, ALWAYS run `manage_dependencies` with action `install` and ecosystem `platformio` (which runs `pio pkg install`) to sync the downloaded packages.
+- **Arduino library install rule:** NEVER instruct the user to open the Arduino IDE GUI to install a library. Always install programmatically:
+  - PlatformIO project (`platformio.ini` exists): add the library to `lib_deps`, then `manage_dependencies(action="install", ecosystem="platformio")` to run `pio pkg install`.
+  - Pure `.ino` project (no `platformio.ini`): `manage_dependencies(action="install", ecosystem="arduino-cli", packages=["LibraryName"])` which runs `arduino-cli lib install`.
+  - To compile/upload a `.ino` without converting to PlatformIO: use `build_upload_ino` tool.
+  - If `arduino-cli` is not installed: `run_command("curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh")` or guide the user to install it.
 
 **PLAN MODE (for multi-step operations):**
 When the user asks you to perform multiple steps (e.g., "create a Python project", "set up a server", "configure something"), you MUST:
@@ -1006,6 +1050,7 @@ class AIAgent:
             "detect_microcontroller": self._tool_detect_microcontroller,
             "build_microcontroller": self._tool_build_microcontroller,
             "upload_microcontroller": self._tool_upload_microcontroller,
+            "build_upload_ino": self._tool_build_upload_ino,
             "flash_sketch_file": self._tool_flash_sketch_file,
             "manage_dependencies": self._tool_manage_dependencies,
             "generate_flowchart": self._tool_generate_flowchart,
@@ -1590,6 +1635,65 @@ class AIAgent:
                 return f"✗ Upload failed: {result['error']}\n\n{result['output']}"
         except Exception as exc:
             return f"Error uploading firmware: {exc}"
+
+    def _tool_build_upload_ino(self, args: dict) -> str:
+        """Compile (and optionally upload) a .ino sketch natively with arduino-cli."""
+        if not self.arduino_manager:
+            return "Error: Arduino support not available."
+
+        sketch_raw = (args.get("sketch_path") or "").strip()
+        if not sketch_raw:
+            return "Error: sketch_path is required."
+
+        fqbn = (args.get("fqbn") or "").strip()
+        port = (args.get("port") or "").strip()
+        compile_only = bool(args.get("compile_only", False))
+
+        sketch_path = self._resolve_path(sketch_raw)
+
+        if not self.arduino_manager.arduino_cli_path:
+            return (
+                "Error: arduino-cli not found. Install it with:\n"
+                "  curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh\n"
+                "Then run: arduino-cli core update-index"
+            )
+
+        # Auto-detectar placa y FQBN si no se proporcionaron
+        if not fqbn or not port:
+            boards = self.arduino_manager.detect_installed_boards()
+            if boards:
+                if not port:
+                    port = boards[0].get("port", "")
+                if not fqbn:
+                    fqbn = boards[0].get("fqbn", "arduino:avr:uno")
+                board_name = boards[0].get("name", "Unknown")
+            else:
+                fqbn = fqbn or "arduino:avr:uno"
+                board_name = "Unknown (using default)"
+        else:
+            board_name = fqbn
+
+        if compile_only:
+            result = self.arduino_manager.build_ino(sketch_path, fqbn)
+            status = "✓ Compiled" if result["ok"] else "✗ Compile failed"
+            return (
+                f"{status} [{fqbn}]\n"
+                f"Time: {result['time_seconds']:.1f}s\n\n"
+                f"{result['output']}"
+                + (f"\n\nError: {result['error']}" if result["error"] else "")
+            )
+
+        # Compilar + subir
+        result = self.arduino_manager.upload_ino(sketch_path, fqbn, port)
+        status = "✓ Compiled & uploaded" if result["ok"] else "✗ Upload failed"
+        return (
+            f"{status}\n"
+            f"Board: {board_name} [{fqbn}]\n"
+            f"Port:  {port or '(auto)'}\n"
+            f"Time:  {result['time_seconds']:.1f}s\n\n"
+            f"{result['output']}"
+            + (f"\n\nError: {result['error']}" if result["error"] else "")
+        )
 
     def _tool_flash_sketch_file(self, args: dict) -> str:
         """Prepare project from .ino, then compile and upload in one flow."""

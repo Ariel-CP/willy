@@ -57,7 +57,137 @@ class ArduinoManager:
         self.on_status = on_status or (lambda x: None)
         self.on_error = on_error or (lambda x: None)
         self.platformio_path = None
+        self.arduino_cli_path: Optional[str] = None
         self._detect_platformio()
+        self._detect_arduino_cli()
+
+    def _detect_arduino_cli(self) -> None:
+        """Detect arduino-cli installation."""
+        import shutil
+        found = shutil.which("arduino-cli")
+        if found:
+            self.arduino_cli_path = found
+            return
+        common = [
+            Path.home() / ".local" / "bin" / "arduino-cli",
+            Path("/usr/local/bin/arduino-cli"),
+            Path("/usr/bin/arduino-cli"),
+        ]
+        for p in common:
+            if p.exists():
+                self.arduino_cli_path = str(p)
+                return
+
+    def build_ino(
+        self,
+        sketch_path: str,
+        fqbn: str = "arduino:avr:uno",
+    ) -> Dict:
+        """Compile a .ino sketch with arduino-cli.
+
+        Args:
+            sketch_path: Path to the .ino file or its parent folder.
+            fqbn: Fully Qualified Board Name (e.g. "arduino:avr:uno",
+                  "esp32:esp32:esp32dev").
+
+        Returns:
+            {"ok": bool, "output": str, "error": str, "time_seconds": float}
+        """
+        import time
+        if not self.arduino_cli_path:
+            return {"ok": False, "output": "", "error": "arduino-cli not found.", "time_seconds": 0.0}
+
+        sketch_dir = str(Path(sketch_path).parent if sketch_path.endswith(".ino") else sketch_path)
+        self.on_status(f"Compiling {sketch_dir} [{fqbn}]…")
+        start = time.time()
+        try:
+            result = subprocess.run(
+                [self.arduino_cli_path, "compile", "--fqbn", fqbn, sketch_dir],
+                capture_output=True, text=True, timeout=300,
+            )
+            elapsed = time.time() - start
+            output = (result.stdout + result.stderr).strip()
+            ok = result.returncode == 0
+            if ok:
+                self.on_status("Compile OK")
+            return {"ok": ok, "output": output, "error": "" if ok else f"Exit {result.returncode}", "time_seconds": elapsed}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "output": "", "error": "Compile timed out (>300s).", "time_seconds": time.time() - start}
+        except Exception as exc:
+            return {"ok": False, "output": "", "error": str(exc), "time_seconds": time.time() - start}
+
+    def upload_ino(
+        self,
+        sketch_path: str,
+        fqbn: str = "arduino:avr:uno",
+        port: str = "",
+    ) -> Dict:
+        """Compile and upload a .ino sketch with arduino-cli.
+
+        Args:
+            sketch_path: Path to the .ino file or its parent folder.
+            fqbn: Fully Qualified Board Name.
+            port: Serial port (e.g. /dev/ttyUSB0). Auto-detected if empty.
+
+        Returns:
+            {"ok": bool, "output": str, "error": str, "time_seconds": float}
+        """
+        import time
+        if not self.arduino_cli_path:
+            return {"ok": False, "output": "", "error": "arduino-cli not found.", "time_seconds": 0.0}
+
+        if not port:
+            boards = self.detect_installed_boards()
+            port = next((b.get("port", "") for b in boards if b.get("port")), "")
+
+        sketch_dir = str(Path(sketch_path).parent if sketch_path.endswith(".ino") else sketch_path)
+        self.on_status(f"Uploading {sketch_dir} [{fqbn}] → {port or '?'}…")
+        start = time.time()
+        cmd = [self.arduino_cli_path, "compile", "--upload", "--fqbn", fqbn, sketch_dir]
+        if port:
+            cmd += ["-p", port]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            elapsed = time.time() - start
+            output = (result.stdout + result.stderr).strip()
+            ok = result.returncode == 0
+            if ok:
+                self.on_status("Upload OK")
+            return {"ok": ok, "output": output, "error": "" if ok else f"Exit {result.returncode}", "time_seconds": elapsed}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "output": "", "error": "Upload timed out (>300s).", "time_seconds": time.time() - start}
+        except Exception as exc:
+            return {"ok": False, "output": "", "error": str(exc), "time_seconds": time.time() - start}
+
+    def detect_installed_boards(self) -> List[Dict]:
+        """Return list of connected boards detected by arduino-cli.
+
+        Returns list of {"port", "fqbn", "name"} dicts.
+        """
+        if not self.arduino_cli_path:
+            return []
+        try:
+            result = subprocess.run(
+                [self.arduino_cli_path, "board", "list", "--format", "json"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                return []
+            import json as _json
+            data = _json.loads(result.stdout)
+            # arduino-cli 0.35+: {"detected_ports": [...]}
+            ports = data.get("detected_ports") or data if isinstance(data, list) else []
+            boards = []
+            for entry in ports:
+                port_addr = entry.get("port", {}).get("address", "") or entry.get("address", "")
+                matching = entry.get("matching_boards") or []
+                fqbn = matching[0].get("fqbn", "") if matching else ""
+                name = matching[0].get("name", "Unknown") if matching else "Unknown"
+                if port_addr:
+                    boards.append({"port": port_addr, "fqbn": fqbn, "name": name})
+            return boards
+        except Exception:
+            return []
     
     def _detect_platformio(self) -> None:
         """Detect PlatformIO installation."""
