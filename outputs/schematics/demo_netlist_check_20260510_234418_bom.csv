@@ -1,8 +1,0 @@
-title,demo_netlist_check
-board,esp32
-components,2
-connections,3
-
-id,type,label,value,notes
-U1,board,ESP32,,
-S1,sensor,DHT22,,

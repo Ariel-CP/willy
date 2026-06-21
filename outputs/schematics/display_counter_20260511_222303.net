@@ -1,6 +1,0 @@
-# Willy IoT Netlist
-BOARD arduino
-NETS 2
-
-N001 Display de 7 Segmentos -> Arduino [Digit Pins 2, 3, 4, 5]
-N002 Display de 7 Segmentos -> Arduino [Segment Pins 6, 7, 8, 9, 10, 11, 12, 13]

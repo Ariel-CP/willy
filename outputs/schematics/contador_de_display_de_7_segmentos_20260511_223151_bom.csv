@@ -1,9 +1,0 @@
-title,Contador de Display de 7 Segmentos
-board,Arduino Uno
-components,3
-connections,13
-
-id,type,label,value,notes
-C1,Arduino,Arduino Uno,,
-C2,LED Display,4-Digit 7-Segment,,Common Anode
-C3,Resistor,Resistors for Segments,,If needed based on the LED display type

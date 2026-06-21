@@ -1,9 +1,0 @@
-title,Display Counter
-board,Arduino Uno
-components,3
-connections,2
-
-id,type,label,value,notes
-TM1637,display,TM1637,,Modulo de 4 dígitos
-A1,pin,CLK,,Pin de reloj del TM1637 conectado a D2 del Arduino
-A2,pin,DIO,,Pin de datos del TM1637 conectado a D3 del Arduino

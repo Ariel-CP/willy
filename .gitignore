@@ -3,3 +3,12 @@ config.json
 __pycache__/
 *.pyc
 sessions/
+
+# Runtime / generados
+environment_memory.json
+environment_memory_history/
+willy_tool_errors.log
+outputs/
+.pio/
+.coverage
+*.log

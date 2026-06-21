@@ -1,8 +1,0 @@
-title,Display HW-069 con Arduino Uno
-board,arduino uno
-components,2
-connections,1
-
-id,type,label,value,notes
-display,7-segment display,Display 4 dígitos,,HW-069
-resistor,resistor,,220Ω,Resistencias para los segmentos del display
