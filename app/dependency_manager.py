@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +74,7 @@ class DependencyManager:
     """Detect ecosystem, snapshot, install/update with balanced policy, rollback."""
 
     SNAPSHOT_FILE = ".willy_dep_snapshot.json"
+    _snapshot_lock = threading.Lock()  # protege lectura+escritura atómica del archivo
 
     def __init__(self, base_dir: str) -> None:
         self.base_dir = Path(base_dir)
@@ -466,24 +468,28 @@ class DependencyManager:
 
     def _persist_snapshot(self, snap: DepSnapshot, project_path: str | None) -> None:
         path = self._snapshot_path(project_path)
-        try:
-            existing: list[Any] = []
-            if path.exists():
-                with open(path, "r", encoding="utf-8") as fh:
-                    existing = json.load(fh)
-            if not isinstance(existing, list):
-                existing = []
-            # Keep only last 3 per ecosystem.
-            existing = [e for e in existing if e.get("ecosystem") != snap.ecosystem][-2:]
-            existing.append({
-                "ecosystem": snap.ecosystem,
-                "timestamp": snap.timestamp,
-                "packages": snap.packages,
-            })
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(existing, fh, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        with self._snapshot_lock:
+            try:
+                existing: list[Any] = []
+                if path.exists():
+                    with open(path, "r", encoding="utf-8") as fh:
+                        existing = json.load(fh)
+                if not isinstance(existing, list):
+                    existing = []
+                # Keep only last 3 per ecosystem.
+                existing = [e for e in existing if e.get("ecosystem") != snap.ecosystem][-2:]
+                existing.append({
+                    "ecosystem": snap.ecosystem,
+                    "timestamp": snap.timestamp,
+                    "packages": snap.packages,
+                })
+                # Escritura atómica: escribir en .tmp y renombrar
+                tmp_path = path.with_suffix(".tmp")
+                with open(tmp_path, "w", encoding="utf-8") as fh:
+                    json.dump(existing, fh, ensure_ascii=False, indent=2)
+                tmp_path.replace(path)
+            except Exception:
+                pass
 
     def _load_last_snapshot(self, ecosystem: str, project_path: str | None) -> DepSnapshot | None:
         path = self._snapshot_path(project_path)

@@ -441,7 +441,7 @@ Guidelines:
 - **Traceability (mandatory):** When using web data, ALWAYS include: source URL, date consulted, and source quality level (official/community). Example: "Source: https://... | consulted: 2026-06-20 | quality: official_docs"
 - Be concise and helpful. Respond in the same language the user uses.
 - If a tool or command fails, analyze the error output and suggest a fix.
-- **platformio.ini rule:** ALWAYS use `read_file` to inspect the current content of `platformio.ini` BEFORE writing it. When modifying `lib_deps`, write the COMPLETE replacement block — never append to existing entries. Duplicate lib_deps entries (same library, different owner) cause build failures. If you detect a build error caused by an unknown package, use `manage_dependencies` with action `sanitize_pio` to auto-clean duplicates.
+- **platformio.ini rule:** ALWAYS use `read_file` to inspect the current content of `platformio.ini` BEFORE writing it. When modifying `lib_deps`, write the COMPLETE replacement block — never append to existing entries. Duplicate lib_deps entries (same library, different owner) cause build failures. If you detect a build error caused by an unknown package, use `manage_dependencies` with action `sanitize_pio` to auto-clean duplicates. After adding or modifying `lib_deps`, ALWAYS run `manage_dependencies` with action `install` and ecosystem `platformio` (which runs `pio pkg install`) to sync the downloaded packages.
 
 **PLAN MODE (for multi-step operations):**
 When the user asks you to perform multiple steps (e.g., "create a Python project", "set up a server", "configure something"), you MUST:
@@ -835,6 +835,17 @@ class AIAgent:
         self.on_status(i18n.get("ai_thinking"))
         self._progress_value = 0.0
         self._emit_progress(5, "Analizando solicitud")
+
+        # Verificar presupuesto de tokens ANTES de llamar a la API
+        if self.session_total_tokens >= self.session_token_budget:
+            self.on_message(
+                "system",
+                f"⚠ Presupuesto de tokens agotado ({self.session_total_tokens}/{self.session_token_budget}). "
+                "Reiniciá la sesión o aumentá el límite en Configuración.",
+            )
+            self.on_status("Budget agotado")
+            return
+
         try:
             client = self._get_client()
             model = self.config.get("model", "gpt-4o")

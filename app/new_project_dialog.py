@@ -81,6 +81,7 @@ TEMPLATES: dict[str, dict] = {
         "description": "Solo la carpeta del proyecto.",
         "files": [
             ("diagrams/.gitkeep", ""),
+            (".gitignore", "# Archivos generados\nbuild/\n*.hex\n*.elf\n*.bin\n*.map\n*.o\n*.a\n"),
         ],
     },
     "Arduino (.ino)": {
@@ -88,10 +89,11 @@ TEMPLATES: dict[str, dict] = {
         "files": [
             ("{name}/{name}.ino", "void setup() {{\n  // inicialización\n}}\n\nvoid loop() {{\n  // lógica principal\n}}\n"),
             ("diagrams/.gitkeep", ""),
+            (".gitignore", "# Arduino IDE\nbuild/\n*.hex\n*.elf\n*.bin\n*.map\n*.o\n*.a\n"),
         ],
     },
     "PlatformIO": {
-        "description": "Proyecto PlatformIO con src/ y platformio.ini.",
+        "description": "Proyecto PlatformIO — Arduino UNO.",
         "files": [
             ("platformio.ini", "[env:uno]\nplatform = atmelavr\nboard = uno\nframework = arduino\n"),
             ("src/main.cpp", '#include <Arduino.h>\n\nvoid setup() {{\n  Serial.begin(115200);\n}}\n\nvoid loop() {{\n}}\n'),
@@ -99,6 +101,84 @@ TEMPLATES: dict[str, dict] = {
             ("lib/README", "Put project libraries here.\n"),
             ("test/README", "Put project tests here.\n"),
             ("diagrams/.gitkeep", ""),
+            (".gitignore", "# PlatformIO\n.pio/\n.vscode/\nbuild/\n*.hex\n*.elf\n*.bin\n*.map\n*.o\n*.a\n"),
+        ],
+    },
+    "PlatformIO — ESP32": {
+        "description": "Proyecto PlatformIO para ESP32 DevKit (240 MHz, WiFi/BT, 3.3 V).",
+        "files": [
+            ("platformio.ini",
+             "[env:esp32dev]\n"
+             "platform = espressif32\n"
+             "board = esp32dev\n"
+             "framework = arduino\n"
+             "monitor_speed = 115200\n"
+             "upload_speed = 921600\n"),
+            ("src/main.cpp",
+             '#include <Arduino.h>\n\n'
+             'void setup() {{\n'
+             '  Serial.begin(115200);\n'
+             '  Serial.println("ESP32 listo");\n'
+             '}}\n\n'
+             'void loop() {{\n'
+             '  // lógica principal\n'
+             '}}\n'),
+            ("include/README", "Put project header files here.\n"),
+            ("lib/README", "Put project libraries here.\n"),
+            ("diagrams/.gitkeep", ""),
+            (".gitignore", "# PlatformIO\n.pio/\n.vscode/\nbuild/\n*.hex\n*.elf\n*.bin\n*.map\n*.o\n*.a\n"),
+        ],
+    },
+    "PlatformIO — ESP8266": {
+        "description": "Proyecto PlatformIO para ESP8266 (NodeMCU / Wemos D1 Mini, WiFi, 3.3 V).",
+        "files": [
+            ("platformio.ini",
+             "[env:nodemcuv2]\n"
+             "platform = espressif8266\n"
+             "board = nodemcuv2\n"
+             "framework = arduino\n"
+             "monitor_speed = 115200\n"
+             "upload_speed = 921600\n"),
+            ("src/main.cpp",
+             '#include <Arduino.h>\n\n'
+             'void setup() {{\n'
+             '  Serial.begin(115200);\n'
+             '  Serial.println("ESP8266 listo");\n'
+             '}}\n\n'
+             'void loop() {{\n'
+             '  // lógica principal\n'
+             '}}\n'),
+            ("include/README", "Put project header files here.\n"),
+            ("lib/README", "Put project libraries here.\n"),
+            ("diagrams/.gitkeep", ""),
+            (".gitignore", "# PlatformIO\n.pio/\n.vscode/\nbuild/\n*.hex\n*.elf\n*.bin\n*.map\n*.o\n*.a\n"),
+        ],
+    },
+    "PlatformIO — Raspberry Pi Pico": {
+        "description": "Proyecto PlatformIO para RP2040 (Pico, Pico W).",
+        "files": [
+            ("platformio.ini",
+             "[env:pico]\n"
+             "platform = raspberrypi\n"
+             "board = pico\n"
+             "framework = arduino\n"
+             "monitor_speed = 115200\n"),
+            ("src/main.cpp",
+             '#include <Arduino.h>\n\n'
+             'void setup() {{\n'
+             '  Serial.begin(115200);\n'
+             '  pinMode(LED_BUILTIN, OUTPUT);\n'
+             '}}\n\n'
+             'void loop() {{\n'
+             '  digitalWrite(LED_BUILTIN, HIGH);\n'
+             '  delay(500);\n'
+             '  digitalWrite(LED_BUILTIN, LOW);\n'
+             '  delay(500);\n'
+             '}}\n'),
+            ("include/README", "Put project header files here.\n"),
+            ("lib/README", "Put project libraries here.\n"),
+            ("diagrams/.gitkeep", ""),
+            (".gitignore", "# PlatformIO\n.pio/\n.vscode/\nbuild/\n*.hex\n*.elf\n*.bin\n*.map\n*.uf2\n*.o\n*.a\n"),
         ],
     },
     "Python": {
@@ -107,6 +187,7 @@ TEMPLATES: dict[str, dict] = {
             ("main.py", "# Proyecto: {name}\n\ndef main():\n    pass\n\nif __name__ == '__main__':\n    main()\n"),
             ("requirements.txt", "# dependencias\n"),
             ("diagrams/.gitkeep", ""),
+            (".gitignore", "# Python\n__pycache__/\n*.pyc\n*.pyo\n.venv/\nvenv/\ndist/\nbuild/\n*.egg-info/\n"),
         ],
     },
 }
@@ -405,6 +486,13 @@ class NewProjectDialog(ctk.CTkToplevel):
                 os.makedirs(os.path.dirname(full_file), exist_ok=True)
                 with open(full_file, "w", encoding="utf-8") as fh:
                     fh.write(content)
+            # Inicializar repositorio Git
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=project_path,
+                capture_output=True,
+                check=False,
+            )
         except OSError as exc:
             messagebox.showerror("Error al crear el proyecto", str(exc), parent=self)
             return

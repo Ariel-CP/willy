@@ -11,6 +11,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ class EnvironmentMemory:
             "snapshot": {},
             "history": [],
         }
+        self._lock = threading.Lock()
         self._load()
 
     def refresh(
@@ -215,23 +217,27 @@ class EnvironmentMemory:
     def _load(self) -> None:
         if not self.path.exists():
             return
-        try:
-            self._data = json.loads(self.path.read_text(encoding="utf-8"))
-            self._harden_permissions(self.path)
-        except Exception:
-            self._data = {
-                "version": 1,
-                "last_updated": "",
-                "snapshot": {},
-                "history": [],
-            }
+        with self._lock:
+            try:
+                self._data = json.loads(self.path.read_text(encoding="utf-8"))
+                self._harden_permissions(self.path)
+            except Exception:
+                self._data = {
+                    "version": 1,
+                    "last_updated": "",
+                    "snapshot": {},
+                    "history": [],
+                }
 
     def _flush(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        with self._lock:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(self._data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self.path)
         self._harden_permissions(self.path)
 
     def _write_history_snapshot(self, stamp: str, snapshot: dict[str, Any]) -> None:

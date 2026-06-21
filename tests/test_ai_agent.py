@@ -312,3 +312,21 @@ def test_repair_history_returns_false_when_clean() -> None:
     assert repaired is False
     assert agent.history == original
 
+
+def test_process_aborts_when_token_budget_exhausted() -> None:
+    """Si el presupuesto de tokens ya está agotado, _process no llama a la API."""
+    messages: list[tuple[str, str]] = []
+    agent = _agent()
+    agent.on_message = lambda role, text: messages.append((role, text))
+    agent.session_token_budget = 1000
+    agent.session_total_tokens = 1000   # agotado
+
+    api_called = []
+    agent._api_call_with_retry = lambda *a, **kw: api_called.append(True)  # type: ignore
+
+    agent._process("test")
+
+    assert not api_called, "La API no debe ser llamada con budget agotado"
+    assert any("agotado" in t.lower() or "budget" in t.lower() for _, t in messages), \
+        "Debe emitir mensaje de budget agotado"
+
