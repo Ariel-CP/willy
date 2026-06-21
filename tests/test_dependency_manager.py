@@ -132,13 +132,26 @@ def test_pio_append_lib_deps_skips_existing_by_basename(tmp_path: Path) -> None:
     assert content.count("RTClib") == 1
 
 
-def test_pio_append_lib_deps_no_lib_deps_block_returns_error(tmp_path: Path) -> None:
+def test_pio_append_lib_deps_no_lib_deps_block_creates_it(tmp_path: Path) -> None:
+    """Cuando no hay lib_deps, debe crearlo en la primera sección [env:...]."""
     ini = tmp_path / "platformio.ini"
     ini.write_text("[env:uno]\nplatform = atmelavr\nboard = uno\n", encoding="utf-8")
     dm = _dm(tmp_path)
+    ok, msg = dm._pio_append_lib_deps(ini, ["bblanchon/ArduinoJson @ ^7.0.0"])
+    assert ok is True
+    content = ini.read_text(encoding="utf-8")
+    assert "lib_deps" in content
+    assert "ArduinoJson" in content
+
+
+def test_pio_append_lib_deps_no_env_section_returns_error(tmp_path: Path) -> None:
+    """Sin ninguna sección [env:...] no hay dónde crear lib_deps."""
+    ini = tmp_path / "platformio.ini"
+    ini.write_text("[platformio]\ndefault_envs = uno\n", encoding="utf-8")
+    dm = _dm(tmp_path)
     ok, msg = dm._pio_append_lib_deps(ini, ["somelib"])
     assert ok is False
-    assert "lib_deps" in msg.lower()
+    assert "env" in msg.lower()
 
 
 def test_pio_restore_lib_deps_overwrites_block(tmp_path: Path) -> None:

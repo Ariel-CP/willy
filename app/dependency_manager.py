@@ -103,10 +103,9 @@ class DependencyManager:
         if _which("apt"):
             ecosystems.append("apt")
         if _which("arduino-cli") and proj and any(proj.glob("*.ino")):
-            # Proyecto Arduino IDE nativo (contiene .ino)
-            ecosystems.append("arduino-cli")
+            # Proyecto Arduino IDE nativo (contiene .ino) — prioridad
+            ecosystems.insert(0, "arduino-cli")
         elif _which("arduino-cli"):
-            ecosystems.append("arduino-cli")
             ecosystems.append("arduino-cli")
         return ecosystems
 
@@ -410,18 +409,40 @@ class DependencyManager:
         if in_lib_deps:
             insert_at = len(lines)  # lib_deps al final del archivo
 
-        if insert_at is None:
-            return False, "No lib_deps block found in platformio.ini. Add lib_deps to the [env:...] section first."
-
         to_add = [p for p in packages if _base(p) not in existing]
-        if not to_add:
-            return True, "All packages already declared in lib_deps."
 
-        additions = [f"    {pkg}\n" for pkg in to_add]
-        new_lines = lines[:insert_at] + additions + lines[insert_at:]
+        if insert_at is not None:
+            # Bloque lib_deps existente — insertar nuevas entradas.
+            if not to_add:
+                return True, "All packages already declared in lib_deps."
+            additions = [f"    {pkg}\n" for pkg in to_add]
+            new_lines = lines[:insert_at] + additions + lines[insert_at:]
+            try:
+                ini_path.write_text("".join(new_lines), encoding="utf-8")
+                return True, f"Added to lib_deps: {', '.join(to_add)}"
+            except OSError as exc:
+                return False, str(exc)
+
+        # No hay bloque lib_deps — crearlo en la primera sección [env:...].
+        section_start: int | None = None
+        section_end: int = len(lines)
+        for i, line in enumerate(lines):
+            s = line.rstrip()
+            if re.match(r"^\[env:", s, re.IGNORECASE):
+                section_start = i + 1
+            elif section_start is not None and re.match(r"^\[", s):
+                section_end = i
+                break
+
+        if section_start is None:
+            return False, "No [env:...] section found in platformio.ini. Cannot create lib_deps."
+
+        pkgs_to_write = to_add if to_add else packages
+        additions = ["lib_deps =\n"] + [f"    {pkg}\n" for pkg in pkgs_to_write]
+        new_lines = lines[:section_end] + additions + lines[section_end:]
         try:
             ini_path.write_text("".join(new_lines), encoding="utf-8")
-            return True, f"Added to lib_deps: {', '.join(to_add)}"
+            return True, f"Created lib_deps with: {', '.join(pkgs_to_write)}"
         except OSError as exc:
             return False, str(exc)
 
