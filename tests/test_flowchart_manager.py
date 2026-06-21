@@ -115,3 +115,39 @@ def test_parse_arduino_flow_handles_empty_sketch(tmp_path) -> None:
     flow = fm._parse_arduino_flow("void setup(){} void loop(){}")
     assert isinstance(flow["setup"], list)
     assert isinstance(flow["loop"], list)
+
+
+def test_render_as_html_creates_valid_file(tmp_path) -> None:
+    """render_as_html genera un archivo HTML con el contenido Mermaid embebido."""
+    fm = FlowchartManager(base_dir=str(tmp_path))
+
+    mmd = tmp_path / "test.mmd"
+    mmd.write_text("flowchart TD\n    A --> B", encoding="utf-8")
+    html = tmp_path / "test.html"
+
+    ok = fm.render_as_html(str(mmd), str(html), title="Test Diagram")
+
+    assert ok is True
+    assert html.exists()
+    content = html.read_text(encoding="utf-8")
+    assert "mermaid" in content
+    assert "flowchart TD" in content
+    assert "A --> B" in content
+    assert "Test Diagram" in content
+
+
+def test_generate_from_ino_sketch_creates_html(tmp_path) -> None:
+    """generate_from_ino_sketch debe generar html_path además del mmd."""
+    sketch_dir = tmp_path / "sketch"
+    sketch_dir.mkdir()
+    ino = sketch_dir / "sketch.ino"
+    ino.write_text(LCD_SKETCH, encoding="utf-8")
+
+    fm = FlowchartManager(base_dir=str(tmp_path))
+    result = fm.generate_from_ino_sketch(str(ino), title="sketch")
+
+    assert result.ok is True
+    assert result.html_path and os.path.isfile(result.html_path)
+    html_content = open(result.html_path).read()
+    assert "mermaid" in html_content.lower()
+    assert "setup()" in html_content

@@ -1369,9 +1369,21 @@ class WillyApp(ctk.CTk):
             },
         )
 
+        # Preferir HTML (Mermaid JS) → SVG → lo que haya
+        open_path = ""
+        if isinstance(diagram_path, str) and diagram_path.lower().endswith(".html") and os.path.isfile(diagram_path):
+            open_path = diagram_path
+        elif selected_path and os.path.isfile(selected_path):
+            # Buscar HTML junto al archivo seleccionado
+            html_candidate = os.path.splitext(selected_path)[0] + ".html"
+            if os.path.isfile(html_candidate):
+                open_path = html_candidate
+            else:
+                open_path = selected_path
+
         try:
-            if selected_path and os.path.isfile(selected_path):
-                webbrowser.open(f"file://{selected_path}")
+            if open_path:
+                webbrowser.open(f"file://{open_path}")
         except Exception:
             pass
 
@@ -1393,7 +1405,8 @@ class WillyApp(ctk.CTk):
                 fm = FlowchartManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
                 result = fm.generate_from_ino_sketch(ino_path, title=title)
                 if result.ok:
-                    display = result.svg_path or result.png_path or result.mmd_path
+                    # Pasar html_path como diagram_path para que la GUI abra el HTML
+                    display = result.html_path or result.svg_path or result.png_path or result.mmd_path
                     self.after(0, self._apply_generated_flowchart, display, result.mmd_path)
             except Exception:
                 pass

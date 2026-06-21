@@ -18,6 +18,7 @@ class FlowchartResult:
     mmd_path: str = ""
     svg_path: str = ""
     png_path: str = ""
+    html_path: str = ""
 
 
 class FlowchartManager:
@@ -80,6 +81,10 @@ class FlowchartManager:
             outline,
         )
 
+        # HTML (Mermaid JS en navegador — no requiere mmdc)
+        html_path = os.path.join(flow_dir, f"{base_name}.html")
+        html_ok = self.render_as_html(mmd_path, html_path, title=display_title)
+
         return FlowchartResult(
             ok=True,
             message=render_message,
@@ -87,6 +92,7 @@ class FlowchartManager:
             mmd_path=mmd_path,
             svg_path=svg_path if svg_ready else "",
             png_path=png_path if png_ready else "",
+            html_path=html_path if html_ok else "",
         )
 
     def generate_from_ino_sketch(self, sketch_path: str, title: str = "") -> FlowchartResult:
@@ -126,6 +132,10 @@ class FlowchartManager:
         except Exception as exc:
             return FlowchartResult(ok=False, message=f"Cannot write .mmd: {exc}")
 
+        # HTML (Mermaid JS en navegador — no requiere mmdc)
+        html_path = os.path.join(flow_dir, f"{base_name}.html")
+        html_ok = self.render_as_html(mmd_path, html_path, title=display_title)
+
         # Build a minimal outline for the SVG fallback renderer
         outline = {
             "files": [os.path.basename(ino_abs)],
@@ -142,6 +152,7 @@ class FlowchartManager:
             mmd_path=mmd_path,
             svg_path=svg_path if svg_ready else "",
             png_path=png_path if png_ready else "",
+            html_path=html_path if html_ok else "",
         )
 
     # ------------------------------------------------------------------
@@ -419,6 +430,80 @@ class FlowchartManager:
             if path and os.path.isfile(path) and os.access(path, os.X_OK):
                 return path
         return ""
+
+    def render_as_html(self, mmd_path: str, html_path: str, title: str = "") -> bool:
+        """Generate a standalone HTML file that renders the Mermaid diagram via CDN.
+
+        Returns True on success.
+        """
+        try:
+            with open(mmd_path, "r", encoding="utf-8") as fh:
+                mmd_content = fh.read().strip()
+        except Exception:
+            return False
+
+        display_title = title or os.path.splitext(os.path.basename(mmd_path))[0]
+        # Escape for embedding inside a <pre> tag
+        escaped = mmd_content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        html = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{display_title} — Willy Flowchart</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <style>
+    body {{
+      margin: 0;
+      padding: 24px;
+      background: #0f1117;
+      color: #e2e8f0;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+    }}
+    h2 {{
+      margin: 0 0 18px;
+      font-size: 1.2rem;
+      color: #94a3b8;
+      letter-spacing: 0.04em;
+    }}
+    .mermaid {{
+      background: #1e293b;
+      border-radius: 12px;
+      padding: 28px 20px;
+      display: inline-block;
+      min-width: 400px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+    }}
+    .footer {{
+      margin-top: 16px;
+      font-size: 0.75rem;
+      color: #475569;
+    }}
+  </style>
+</head>
+<body>
+  <h2>⚡ {display_title}</h2>
+  <div class="mermaid">
+{mmd_content}
+  </div>
+  <p class="footer">Generado por Willy · {display_title}</p>
+  <script>
+    mermaid.initialize({{
+      startOnLoad: true,
+      theme: 'dark',
+      flowchart: {{ curve: 'basis', padding: 20 }},
+    }});
+  </script>
+</body>
+</html>
+"""
+        try:
+            with open(html_path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+            return True
+        except Exception:
+            return False
 
     def _render_basic_svg(self, svg_path: str, title: str, outline: dict) -> bool:
         files: list[str] = (outline or {}).get("files", [])[:12]
