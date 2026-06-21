@@ -73,7 +73,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write or overwrite a file with the given content.",
+            "description": (
+                "Write or overwrite a file with the given content. "
+                "Automatically creates parent directories if they do not exist — "
+                "never check with list_directory before writing."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -486,6 +490,11 @@ Guidelines:
   - Pure `.ino` project (no `platformio.ini`): `manage_dependencies(action="install", ecosystem="arduino-cli", packages=["LibraryName"])` which runs `arduino-cli lib install`.
   - To compile/upload a `.ino` without converting to PlatformIO: use `build_upload_ino` tool.
   - If `arduino-cli` is not installed: `run_command("curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh")` or guide the user to install it.
+- **New .ino sketch workflow:** When the user asks you to write AND upload a new `.ino` sketch, ALWAYS follow this exact order — do NOT check if the file exists first:
+  1. `write_file` → write the sketch to `<project_dir>/<sketch_name>/<sketch_name>.ino` (the tool creates parent directories automatically).
+  2. `manage_dependencies(action="install", ecosystem="arduino-cli", packages=[...])` → install required libraries.
+  3. `build_upload_ino(sketch_path=..., fqbn=..., port=...)` → compile and upload.
+  If the user only asks to write the sketch without uploading, stop after step 1.
 
 **PLAN MODE (for multi-step operations):**
 When the user asks you to perform multiple steps (e.g., "create a Python project", "set up a server", "configure something"), you MUST:
