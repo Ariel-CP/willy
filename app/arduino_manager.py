@@ -78,6 +78,40 @@ class ArduinoManager:
                 self.arduino_cli_path = str(p)
                 return
 
+    def _fqbn_platform(self, fqbn: str) -> str:
+        """Extract platform string from fqbn, e.g. 'arduino:avr:uno' → 'arduino:avr'."""
+        parts = fqbn.split(":")
+        return ":".join(parts[:2]) if len(parts) >= 2 else fqbn
+
+    def _ensure_core(self, fqbn: str) -> str:
+        """Install arduino-cli core for fqbn if not present. Returns status message."""
+        platform = self._fqbn_platform(fqbn)
+        self.on_status(f"Instalando core {platform}…")
+        subprocess.run(
+            [self.arduino_cli_path, "core", "update-index"],
+            capture_output=True, text=True, timeout=60,
+        )
+        result = subprocess.run(
+            [self.arduino_cli_path, "core", "install", platform],
+            capture_output=True, text=True, timeout=180,
+        )
+        out = (result.stdout + result.stderr).strip()
+        if result.returncode == 0:
+            self.on_status(f"Core {platform} instalado.")
+        return out
+
+    @staticmethod
+    def _missing_platform(output: str) -> bool:
+        """Return True if output indicates a missing arduino-cli core/platform."""
+        low = output.lower()
+        return any(k in low for k in (
+            "platform not found",
+            "unknown platform",
+            "no such platform",
+            "core not installed",
+            "error loading hardware",
+        ))
+
     def build_ino(
         self,
         sketch_path: str,
@@ -108,6 +142,16 @@ class ArduinoManager:
             elapsed = time.time() - start
             output = (result.stdout + result.stderr).strip()
             ok = result.returncode == 0
+            # Auto-instalar core si la plataforma no está instalada, y reintentar.
+            if not ok and self._missing_platform(output):
+                core_msg = self._ensure_core(fqbn)
+                result2 = subprocess.run(
+                    [self.arduino_cli_path, "compile", "--fqbn", fqbn, sketch_dir],
+                    capture_output=True, text=True, timeout=300,
+                )
+                output = (result2.stdout + result2.stderr).strip()
+                ok = result2.returncode == 0
+                output = f"[core auto-installed: {core_msg[:120]}]\n{output}"
             if ok:
                 self.on_status("Compile OK")
             return {"ok": ok, "output": output, "error": "" if ok else f"Exit {result.returncode}", "time_seconds": elapsed}
@@ -151,6 +195,13 @@ class ArduinoManager:
             elapsed = time.time() - start
             output = (result.stdout + result.stderr).strip()
             ok = result.returncode == 0
+            # Auto-instalar core si la plataforma no está instalada, y reintentar.
+            if not ok and self._missing_platform(output):
+                core_msg = self._ensure_core(fqbn)
+                result2 = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                output = (result2.stdout + result2.stderr).strip()
+                ok = result2.returncode == 0
+                output = f"[core auto-installed: {core_msg[:120]}]\n{output}"
             if ok:
                 self.on_status("Upload OK")
             return {"ok": ok, "output": output, "error": "" if ok else f"Exit {result.returncode}", "time_seconds": elapsed}

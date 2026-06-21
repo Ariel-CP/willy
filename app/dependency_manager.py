@@ -66,6 +66,40 @@ def _which(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _find_arduino_cli() -> str | None:
+    """Return full path to arduino-cli, checking PATH and common install dirs."""
+    import shutil
+    found = shutil.which("arduino-cli")
+    if found:
+        return found
+    common = [
+        Path.home() / ".local" / "bin" / "arduino-cli",
+        Path("/usr/local/bin/arduino-cli"),
+        Path("/usr/bin/arduino-cli"),
+    ]
+    for p in common:
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _find_pio() -> str | None:
+    """Return full path to pio, checking PATH and common install dirs."""
+    import shutil
+    found = shutil.which("pio")
+    if found:
+        return found
+    common = [
+        Path.home() / ".local" / "bin" / "pio",
+        Path("/usr/local/bin/pio"),
+        Path("/usr/bin/pio"),
+    ]
+    for p in common:
+        if p.exists():
+            return str(p)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Core manager
 # ---------------------------------------------------------------------------
@@ -88,7 +122,7 @@ class DependencyManager:
         ecosystems: list[str] = []
         proj = Path(project_path) if project_path else None
 
-        if proj and (proj / "platformio.ini").exists() and _which("pio"):
+        if proj and (proj / "platformio.ini").exists() and _find_pio():
             ecosystems.append("platformio")
         if proj and (proj / "package.json").exists() and _which("npm"):
             ecosystems.append("npm")
@@ -102,10 +136,10 @@ class DependencyManager:
             ecosystems.append("pip")
         if _which("apt"):
             ecosystems.append("apt")
-        if _which("arduino-cli") and proj and any(proj.glob("*.ino")):
+        if _find_arduino_cli() and proj and any(proj.glob("*.ino")):
             # Proyecto Arduino IDE nativo (contiene .ino) — prioridad
             ecosystems.insert(0, "arduino-cli")
-        elif _which("arduino-cli"):
+        elif _find_arduino_cli():
             ecosystems.append("arduino-cli")
         return ecosystems
 
@@ -184,7 +218,8 @@ class DependencyManager:
             if not ok_add:
                 return DepResult(ok=False, ecosystem=ecosystem, action="install",
                                  message=msg_add)
-            rc, out, err = _run(["pio", "pkg", "install"], cwd=project_path, timeout=120)
+            pio = _find_pio() or "pio"
+            rc, out, err = _run([pio, "pkg", "install"], cwd=project_path, timeout=120)
             ok = rc == 0
             detail = (out or err or ("OK" if ok else "Failed"))[:800]
             return DepResult(
@@ -196,7 +231,11 @@ class DependencyManager:
                 rollback_available=True,
             )
         elif ecosystem == "arduino-cli":
-            cmd = ["arduino-cli", "lib", "install"] + packages
+            cli = _find_arduino_cli()
+            if not cli:
+                return DepResult(ok=False, ecosystem=ecosystem, action="install",
+                                 message="arduino-cli not found. Install with: curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz | tar -xz -C ~/.local/bin")
+            cmd = [cli, "lib", "install"] + packages
         else:
             return DepResult(ok=False, ecosystem=ecosystem, action="install",
                              message=f"Unsupported ecosystem '{ecosystem}' or missing project_path.")
@@ -247,13 +286,18 @@ class DependencyManager:
             else:
                 cmd = ["npm", "update"]
         elif ecosystem == "platformio" and project_path:
-            rc, out, err = _run(["pio", "pkg", "update"], cwd=project_path, timeout=180)
+            pio = _find_pio() or "pio"
+            rc, out, err = _run([pio, "pkg", "update"], cwd=project_path, timeout=180)
             ok = rc == 0
             msg = (out or err or ("OK" if ok else "Failed"))[:1200]
             return DepResult(ok=ok, ecosystem=ecosystem, action="update",
                              message=msg, rollback_available=True)
         elif ecosystem == "arduino-cli":
-            cmd = ["arduino-cli", "lib", "upgrade"]
+            cli = _find_arduino_cli()
+            if not cli:
+                return DepResult(ok=False, ecosystem=ecosystem, action="update",
+                                 message="arduino-cli not found.")
+            cmd = [cli, "lib", "upgrade"]
         else:
             return DepResult(ok=False, ecosystem=ecosystem, action="update",
                              message=f"Unsupported ecosystem '{ecosystem}'.")
@@ -299,7 +343,8 @@ class DependencyManager:
             ok_r, msg_r = self._pio_restore_lib_deps(ini_path, snap.packages)
             if not ok_r:
                 return DepResult(ok=False, ecosystem=ecosystem, action="rollback", message=msg_r)
-            rc, out, err = _run(["pio", "pkg", "install"], cwd=project_path, timeout=120)
+            pio = _find_pio() or "pio"
+            rc, out, err = _run([pio, "pkg", "install"], cwd=project_path, timeout=120)
             ok = rc == 0
             detail = (out or err or ("OK" if ok else "Failed"))[:800]
             return DepResult(ok=ok, ecosystem=ecosystem, action="rollback",

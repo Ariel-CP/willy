@@ -278,3 +278,37 @@ def test_new_project_pico_template_has_correct_board() -> None:
     ini_content = next(c for f, c in tpl["files"] if f == "platformio.ini")
     assert "pico" in ini_content
     assert "raspberrypi" in ini_content
+
+
+# ---------------------------------------------------------------------------
+# _find_arduino_cli / _find_pio — detección de rutas
+# ---------------------------------------------------------------------------
+
+def test_find_arduino_cli_returns_str_or_none() -> None:
+    """_find_arduino_cli no lanza excepción y devuelve str o None."""
+    from app.dependency_manager import _find_arduino_cli
+    result = _find_arduino_cli()
+    assert result is None or isinstance(result, str)
+
+
+def test_find_pio_returns_str_or_none() -> None:
+    """_find_pio no lanza excepción y devuelve str o None."""
+    from app.dependency_manager import _find_pio
+    result = _find_pio()
+    assert result is None or isinstance(result, str)
+
+
+def test_install_arduino_cli_fails_without_cli(monkeypatch, tmp_path: Path) -> None:
+    """install con ecosystem arduino-cli falla con mensaje claro si no hay CLI."""
+    import app.dependency_manager as dm_mod
+    monkeypatch.setattr(dm_mod, "_find_arduino_cli", lambda: None)
+    dm = DependencyManager(base_dir=str(tmp_path))
+    result = dm.install("arduino-cli", ["SomeLib"])
+    assert result.ok is False
+    assert "arduino-cli" in result.message.lower()
+
+
+def test_list_boards_tool_on_ai_agent() -> None:
+    """_tool_list_boards es callable en AIAgent."""
+    from app.ai_agent import AIAgent
+    assert callable(getattr(AIAgent, "_tool_list_boards", None))

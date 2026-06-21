@@ -256,6 +256,22 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_boards",
+            "description": (
+                "List all Arduino/ESP32 boards currently connected via USB, detected by arduino-cli. "
+                "Returns port, FQBN, and board name for each device. "
+                "Use this before build_upload_ino when the user has not specified a port or FQBN."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "build_upload_ino",
             "description": (
                 "Compile and upload a .ino sketch natively with arduino-cli — no PlatformIO conversion needed. "
@@ -1059,6 +1075,7 @@ class AIAgent:
             "detect_microcontroller": self._tool_detect_microcontroller,
             "build_microcontroller": self._tool_build_microcontroller,
             "upload_microcontroller": self._tool_upload_microcontroller,
+            "list_boards": self._tool_list_boards,
             "build_upload_ino": self._tool_build_upload_ino,
             "flash_sketch_file": self._tool_flash_sketch_file,
             "manage_dependencies": self._tool_manage_dependencies,
@@ -1644,6 +1661,25 @@ class AIAgent:
                 return f"✗ Upload failed: {result['error']}\n\n{result['output']}"
         except Exception as exc:
             return f"Error uploading firmware: {exc}"
+
+    def _tool_list_boards(self, args: dict) -> str:
+        """List connected Arduino/ESP32 boards via arduino-cli."""
+        if not self.arduino_manager:
+            return "Error: Arduino support not available."
+        if not self.arduino_manager.arduino_cli_path:
+            return (
+                "arduino-cli no encontrado. Instalá con:\n"
+                "curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz "
+                "| tar -xz -C ~/.local/bin"
+            )
+        boards = self.arduino_manager.detect_installed_boards()
+        if not boards:
+            return "No se detectaron placas conectadas. Verificá el cable USB y los drivers."
+        lines = ["Placas detectadas:"]
+        for b in boards:
+            fqbn = b.get("fqbn") or "(FQBN desconocido — usá escaneo I2C para detectar)"
+            lines.append(f"  • {b.get('name', 'Unknown')} | puerto={b.get('port')} | fqbn={fqbn}")
+        return "\n".join(lines)
 
     def _tool_build_upload_ino(self, args: dict) -> str:
         """Compile (and optionally upload) a .ino sketch natively with arduino-cli."""

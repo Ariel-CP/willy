@@ -294,3 +294,55 @@ def test_detect_arduino_cli_finds_echo() -> None:
     result = mgr.arduino_cli_path
     assert result is None or isinstance(result, str)
 
+
+def test_fqbn_platform_extracts_correctly() -> None:
+    """_fqbn_platform extrae los dos primeros segmentos del FQBN."""
+    mgr = _mgr()
+    assert mgr._fqbn_platform("arduino:avr:uno") == "arduino:avr"
+    assert mgr._fqbn_platform("esp32:esp32:esp32dev") == "esp32:esp32"
+    assert mgr._fqbn_platform("rp2040:rp2040:rpipico") == "rp2040:rp2040"
+
+
+def test_missing_platform_detects_error_strings() -> None:
+    """_missing_platform devuelve True ante errores conocidos de plataforma faltante."""
+    mgr = _mgr()
+    assert mgr._missing_platform("Error: platform not found: esp32:esp32")
+    assert mgr._missing_platform("Error loading hardware folders")
+    assert mgr._missing_platform("Unknown platform: rp2040:rp2040")
+    assert mgr._missing_platform("NADA DE ESTO") is False
+
+
+def test_build_ino_auto_installs_core_on_missing_platform(monkeypatch, tmp_path: Path) -> None:
+    """build_ino debe auto-instalar el core y reintentar si la plataforma no está."""
+    import subprocess
+
+    sketch = tmp_path / "blink" / "blink.ino"
+    sketch.parent.mkdir()
+    sketch.write_text("void setup(){} void loop(){}", encoding="utf-8")
+
+    call_log: list[list[str]] = []
+
+    def fake_run(cmd, **kw):
+        call_log.append(cmd)
+        # Primera llamada a compile → falla con "platform not found"
+        if "compile" in cmd and len([c for c in call_log if "compile" in c]) == 1:
+            return type("R", (), {"returncode": 1, "stdout": "platform not found", "stderr": ""})()
+        # core update-index y core install → OK
+        if "update-index" in cmd or "install" in cmd:
+            return type("R", (), {"returncode": 0, "stdout": "installed", "stderr": ""})()
+        # Segunda llamada a compile → éxito
+        return type("R", (), {"returncode": 0, "stdout": "Sketch uses 3150 bytes", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    mgr = _mgr()
+    mgr.arduino_cli_path = "/fake/arduino-cli"
+    result = mgr.build_ino(str(sketch), fqbn="esp32:esp32:esp32dev")
+
+    assert result["ok"] is True
+    assert "core auto-installed" in result["output"]
+    # Debe haber llamado a core update-index y core install
+    cmds = [" ".join(c) for c in call_log]
+    assert any("update-index" in c for c in cmds)
+    assert any("core install" in c for c in cmds)
+
