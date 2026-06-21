@@ -18,6 +18,7 @@ class DiagramResult:
     svg_path: str = ""
     bom_path: str = ""
     netlist_path: str = ""
+    html_path: str = ""
 
 
 class IoTDiagramManager:
@@ -400,6 +401,274 @@ class IoTDiagramManager:
                         comp.get("notes") or "",
                     ]
                 )
+
+    # ------------------------------------------------------------------
+    # HTML wiring diagram
+    # ------------------------------------------------------------------
+
+    # Wire colors by signal type
+    _WIRE_COLORS: dict[str, str] = {
+        "VCC": "#ef4444", "5V": "#ef4444", "3.3V": "#f97316", "3V3": "#f97316",
+        "GND": "#1e293b",
+        "SDA": "#3b82f6", "SCL": "#06b6d4",
+        "MOSI": "#8b5cf6", "MISO": "#a78bfa", "SCK": "#7c3aed", "CS": "#6d28d9",
+        "TX": "#22c55e", "RX": "#16a34a",
+        "PWM": "#f59e0b", "DIGITAL": "#f59e0b", "ANALOG": "#ec4899",
+    }
+
+    def _wire_color(self, signal: str) -> str:
+        up = signal.upper()
+        for key, color in self._WIRE_COLORS.items():
+            if key in up:
+                return color
+        return "#94a3b8"
+
+    def render_connection_html(
+        self,
+        title: str,
+        board: str,
+        components: list[dict[str, Any]],
+        connections: list[dict[str, Any]],
+        html_path: str,
+    ) -> bool:
+        """Generate a standalone HTML file with a visual wiring diagram.
+
+        Shows board + component blocks connected by colored wires.
+        """
+        board_label = (board or "MCU").upper()
+        display_title = title or "Wiring Diagram"
+        safe_board = board_label.replace(":", " ").replace("_", " ")
+
+        # Collect unique signals to assign y positions
+        rows: list[dict] = []
+        for i, conn in enumerate(connections[:24]):
+            rows.append({
+                "from": str(conn.get("from", "")).strip() or f"PIN_{i}",
+                "to": str(conn.get("to", "")).strip() or "?",
+                "signal": str(conn.get("signal", "")).strip() or f"NET{i:02d}",
+            })
+
+        # --- SVG layout constants ---
+        W, H = 900, max(320, 60 + len(rows) * 36 + 60)
+        BOARD_X, BOARD_Y, BOARD_W, BOARD_H = 40, 60, 200, max(200, len(rows) * 32 + 40)
+        COMP_X, COMP_Y, COMP_W = 620, 60, 200
+        COMP_H = BOARD_H
+        MID_X = (BOARD_X + BOARD_W + COMP_X) // 2
+
+        svg_parts: list[str] = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+            f'viewBox="0 0 {W} {H}" style="max-width:100%;border-radius:12px">',
+            f'<rect width="{W}" height="{H}" fill="#0f172a" rx="12"/>',
+            # Board box
+            f'<rect x="{BOARD_X}" y="{BOARD_Y}" width="{BOARD_W}" height="{BOARD_H}" '
+            f'fill="#1e3a5f" stroke="#3b82f6" stroke-width="2" rx="8"/>',
+            f'<text x="{BOARD_X + BOARD_W//2}" y="{BOARD_Y + 22}" text-anchor="middle" '
+            f'font-family="monospace" font-size="13" font-weight="bold" fill="#93c5fd">{safe_board}</text>',
+            # Component box
+            f'<rect x="{COMP_X}" y="{COMP_Y}" width="{COMP_W}" height="{COMP_H}" '
+            f'fill="#1a2e1a" stroke="#22c55e" stroke-width="2" rx="8"/>',
+        ]
+
+        # Component labels
+        comp_names = list(dict.fromkeys(
+            str(c.get("label") or c.get("type") or c.get("id") or "Component")
+            for c in components
+        ))[:4]
+        for ci, cname in enumerate(comp_names):
+            svg_parts.append(
+                f'<text x="{COMP_X + COMP_W//2}" y="{COMP_Y + 22 + ci * 18}" '
+                f'text-anchor="middle" font-family="monospace" font-size="12" '
+                f'font-weight="bold" fill="#86efac">{cname[:22]}</text>'
+            )
+
+        # Wires + pin labels
+        row_start_y = BOARD_Y + 48
+        for i, row in enumerate(rows):
+            y = row_start_y + i * 34
+            color = self._wire_color(row["signal"])
+            bx = BOARD_X + BOARD_W   # right edge of board
+            cx = COMP_X              # left edge of comp box
+            # Wire (bezier curve)
+            svg_parts.append(
+                f'<path d="M{bx},{y} C{MID_X},{y} {MID_X},{y} {cx},{y}" '
+                f'fill="none" stroke="{color}" stroke-width="2.5" opacity="0.85"/>'
+            )
+            # Board pin dot + label
+            svg_parts.append(f'<circle cx="{bx}" cy="{y}" r="4" fill="{color}"/>')
+            svg_parts.append(
+                f'<text x="{bx - 6}" y="{y + 4}" text-anchor="end" '
+                f'font-family="monospace" font-size="11" fill="#e2e8f0">{row["from"]}</text>'
+            )
+            # Signal label in middle
+            svg_parts.append(
+                f'<text x="{MID_X}" y="{y - 6}" text-anchor="middle" '
+                f'font-family="monospace" font-size="10" fill="{color}">{row["signal"]}</text>'
+            )
+            # Component pin dot + label
+            svg_parts.append(f'<circle cx="{cx}" cy="{y}" r="4" fill="{color}"/>')
+            svg_parts.append(
+                f'<text x="{cx + 6}" y="{y + 4}" text-anchor="start" '
+                f'font-family="monospace" font-size="11" fill="#e2e8f0">{row["to"]}</text>'
+            )
+
+        svg_parts.append('</svg>')
+        svg_inline = "\n".join(svg_parts)
+
+        # Connection table rows
+        table_rows = ""
+        for row in rows:
+            color = self._wire_color(row["signal"])
+            table_rows += (
+                f'<tr>'
+                f'<td style="color:#93c5fd">{row["from"]}</td>'
+                f'<td><span style="background:{color};color:#fff;padding:2px 8px;'
+                f'border-radius:4px;font-size:0.85em">{row["signal"]}</span></td>'
+                f'<td style="color:#86efac">{row["to"]}</td>'
+                f'</tr>'
+            )
+
+        html = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{display_title} — Willy Wiring</title>
+  <style>
+    body{{margin:0;padding:20px;background:#0f172a;color:#e2e8f0;
+         font-family:'Segoe UI',system-ui,sans-serif;}}
+    h2{{margin:0 0 16px;font-size:1.15rem;color:#94a3b8}}
+    .diagram{{margin-bottom:24px}}
+    table{{border-collapse:collapse;width:100%;max-width:700px;
+           background:#1e293b;border-radius:10px;overflow:hidden;box-shadow:0 2px 16px #0006}}
+    th{{background:#0f172a;padding:10px 14px;text-align:left;
+        font-size:0.8rem;color:#64748b;letter-spacing:.06em;text-transform:uppercase}}
+    td{{padding:9px 14px;border-bottom:1px solid #334155;font-size:0.88rem}}
+    tr:last-child td{{border-bottom:none}}
+    .footer{{margin-top:14px;font-size:.72rem;color:#475569}}
+  </style>
+</head>
+<body>
+  <h2>🔌 {display_title}</h2>
+  <div class="diagram">{svg_inline}</div>
+  <table>
+    <thead><tr><th>Placa ({safe_board})</th><th>Señal</th><th>Componente</th></tr></thead>
+    <tbody>{table_rows}</tbody>
+  </table>
+  <p class="footer">Generado por Willy</p>
+</body>
+</html>
+"""
+        try:
+            with open(html_path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+            return True
+        except Exception:
+            return False
+
+    def generate_from_ino_source(
+        self,
+        ino_path: str,
+        board: str = "Arduino Uno",
+        title: str = "",
+    ) -> DiagramResult:
+        """Auto-detect components and connections from a .ino file and generate wiring HTML."""
+        import re
+        try:
+            with open(ino_path, "r", encoding="utf-8", errors="replace") as fh:
+                source = fh.read()
+        except Exception as exc:
+            return DiagramResult(ok=False, message=f"Cannot read sketch: {exc}")
+
+        display_title = title or os.path.splitext(os.path.basename(ino_path))[0]
+        safe_title = self._safe_name(display_title)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        html_path = os.path.join(self.output_dir, f"{safe_title}_{stamp}_wiring.html")
+
+        components: list[dict[str, Any]] = []
+        connections: list[dict[str, Any]] = []
+
+        # --- Board detection from source ---
+        if re.search(r'esp32|ESP32', source):
+            board = "ESP32"
+            sda_pin, scl_pin = "GPIO21", "GPIO22"
+        elif re.search(r'esp8266|ESP8266|NodeMCU', source):
+            board = "ESP8266"
+            sda_pin, scl_pin = "D2", "D1"
+        else:
+            board = "Arduino Uno"
+            sda_pin, scl_pin = "A4", "A5"
+
+        # --- LiquidCrystal_I2C ---
+        m = re.search(r'LiquidCrystal_I2C\s+\w+\s*\(\s*(0x[0-9a-fA-F]+|\d+)\s*,\s*(\d+)\s*,\s*(\d+)', source)
+        if m:
+            addr, cols, rows_n = m.group(1), m.group(2), m.group(3)
+            components.append({"id": "LCD1", "type": "LCD", "label": f"LCD I2C {cols}x{rows_n} ({addr})"})
+            connections += [
+                {"from": "5V",    "to": "LCD1 VCC", "signal": "5V"},
+                {"from": "GND",   "to": "LCD1 GND", "signal": "GND"},
+                {"from": sda_pin, "to": "LCD1 SDA", "signal": "SDA"},
+                {"from": scl_pin, "to": "LCD1 SCL", "signal": "SCL"},
+            ]
+
+        # --- DHT sensor ---
+        m = re.search(r'DHT\s+\w+\s*\(\s*(\d+)\s*,', source)
+        if m:
+            pin = m.group(1)
+            components.append({"id": "DHT1", "type": "DHT", "label": f"DHT sensor (pin {pin})"})
+            connections += [
+                {"from": "3.3V",    "to": "DHT1 VCC",  "signal": "3.3V"},
+                {"from": "GND",     "to": "DHT1 GND",  "signal": "GND"},
+                {"from": f"D{pin}", "to": "DHT1 DATA", "signal": "DIGITAL"},
+            ]
+
+        # --- SSD1306 / OLED ---
+        if re.search(r'Adafruit_SSD1306|SSD1306', source):
+            components.append({"id": "OLED1", "type": "OLED", "label": "OLED SSD1306 I2C"})
+            connections += [
+                {"from": "3.3V",   "to": "OLED1 VCC", "signal": "3.3V"},
+                {"from": "GND",    "to": "OLED1 GND", "signal": "GND"},
+                {"from": sda_pin,  "to": "OLED1 SDA", "signal": "SDA"},
+                {"from": scl_pin,  "to": "OLED1 SCL", "signal": "SCL"},
+            ]
+
+        # --- Servo ---
+        m = re.search(r'(\w+)\.attach\s*\(\s*(\d+)', source)
+        if m:
+            pin = m.group(2)
+            components.append({"id": "SRV1", "type": "Servo", "label": f"Servo (pin {pin})"})
+            connections += [
+                {"from": "5V",      "to": "SRV1 VCC",    "signal": "5V"},
+                {"from": "GND",     "to": "SRV1 GND",    "signal": "GND"},
+                {"from": f"D{pin}", "to": "SRV1 Signal", "signal": "PWM"},
+            ]
+
+        # --- BME280 ---
+        if re.search(r'Adafruit_BME280|BME280', source):
+            components.append({"id": "BME1", "type": "BME280", "label": "BME280 I2C"})
+            connections += [
+                {"from": "3.3V",  "to": "BME1 VCC", "signal": "3.3V"},
+                {"from": "GND",   "to": "BME1 GND", "signal": "GND"},
+                {"from": sda_pin, "to": "BME1 SDA", "signal": "SDA"},
+                {"from": scl_pin, "to": "BME1 SCL", "signal": "SCL"},
+            ]
+
+        # --- Generic Wire.begin() (unknown I2C device) ---
+        if not components and re.search(r'Wire\.begin', source):
+            components.append({"id": "I2C1", "type": "I2C Device", "label": "I2C Device (addr desconocida)"})
+            connections += [
+                {"from": sda_pin, "to": "I2C1 SDA", "signal": "SDA"},
+                {"from": scl_pin, "to": "I2C1 SCL", "signal": "SCL"},
+            ]
+
+        if not components:
+            return DiagramResult(ok=False, message="No se detectaron componentes conocidos en el sketch.")
+
+        ok = self.render_connection_html(display_title, board, components, connections, html_path)
+        return DiagramResult(
+            ok=ok,
+            message=f"Wiring diagram: {len(connections)} conexiones detectadas.",
+            html_path=html_path if ok else "",
+        )
 
     def _safe_name(self, value: str) -> str:
         chars = []

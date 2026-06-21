@@ -1402,12 +1402,20 @@ class WillyApp(ctk.CTk):
         def _run() -> None:
             try:
                 from app.flowchart_manager import FlowchartManager
-                fm = FlowchartManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
+                from app.iot_diagram_manager import IoTDiagramManager
+                base = os.path.dirname(os.path.dirname(__file__))
+                fm = FlowchartManager(base_dir=base)
                 result = fm.generate_from_ino_sketch(ino_path, title=title)
                 if result.ok:
-                    # Pasar html_path como diagram_path para que la GUI abra el HTML
                     display = result.html_path or result.svg_path or result.png_path or result.mmd_path
                     self.after(0, self._apply_generated_flowchart, display, result.mmd_path)
+
+                # También generar diagrama de conexiones
+                idm = IoTDiagramManager(base_dir=base)
+                wiring = idm.generate_from_ino_source(ino_path, title=title)
+                if wiring.ok and wiring.html_path:
+                    import webbrowser as _wb
+                    _wb.open(f"file://{wiring.html_path}")
             except Exception:
                 pass
 
