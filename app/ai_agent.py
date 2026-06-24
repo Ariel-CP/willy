@@ -5,6 +5,7 @@ ai_agent.py — OpenAI client with tool/function calling for terminal operations
 import html
 import json
 import os
+import platform
 import threading
 import time
 import urllib.parse
@@ -329,7 +330,18 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = """You are Willy, an intelligent AI assistant and IoT programming specialist fully integrated with the user's Linux (Lubuntu) terminal.
+def _build_system_prompt() -> str:
+    os_name = platform.system() or "Unknown"
+    terminal_hint = (
+        "PowerShell/Windows shell"
+        if os_name == "Windows"
+        else ("Unix shell (Linux/macOS)" if os_name in {"Linux", "Darwin"} else "system shell")
+    )
+
+    return f"""You are Willy, an intelligent AI assistant and IoT programming specialist fully integrated with the user's terminal.
+
+Current host OS: {os_name}
+Expected shell style: {terminal_hint}
 
 You have access to the following tools:
 
@@ -353,6 +365,11 @@ Guidelines:
 - When asked about microcontrollers (Arduino, ESP32, etc.), prefer using IoT tools (detect, build, upload).
 - When asked to design a circuit, wiring, or component diagram, use generate_iot_schematic.
 - For terminal commands, use run_command. For file operations, use read_file/write_file.
+- Use commands that match the host OS. If a Unix command is requested on Windows, use the Windows/PowerShell equivalent.
+- Example equivalents:
+    - Disk usage: `df -h` (Linux/macOS) -> `powershell -NoProfile -Command "Get-PSDrive -PSProvider FileSystem"` (Windows)
+    - Memory usage: `free -h` (Linux/macOS) -> `powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory"` (Windows)
+    - Process list: `ps aux` (Linux/macOS) -> `powershell -NoProfile -Command "Get-Process | Sort-Object CPU -Descending | Select-Object -First 30"` (Windows)
 - For commands that could be destructive (rm, sudo, overwriting files, etc.), briefly explain what you are about to do before the tool call. The UI will ask the user for confirmation.
 - For read-only operations (ls, cat, pwd, search_web, fetch_webpage, detect_microcontroller, etc.) you can proceed directly.
 - Always show relevant command or tool output to the user in your response.
@@ -392,6 +409,9 @@ Limits for safety:
 - If a step fails, pause and explain the error to the user before continuing
 - Always summarize what was executed after completion
 """
+
+
+SYSTEM_PROMPT = _build_system_prompt()
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "willy_tool_errors.log")
 
@@ -780,6 +800,7 @@ class AIAgent:
         command = args.get("command", "").strip()
         if not command:
             return "Error: empty command."
+        command = self._normalize_command_for_platform(command)
         background = args.get("background", False)
 
         if self._needs_confirmation(command):
@@ -823,6 +844,45 @@ class AIAgent:
 
         result = "".join(output_parts)
         return result if result.strip() else "(no output)"
+
+    @staticmethod
+    def _as_windows_powershell(ps_command: str) -> str:
+        escaped = ps_command.replace('"', '\\"')
+        return f'powershell -NoProfile -Command "{escaped}"'
+
+    @staticmethod
+    def _normalize_command_for_platform(command: str) -> str:
+        """Translate common Unix-only commands to Windows equivalents when needed."""
+        if platform.system() != "Windows":
+            return command
+
+        normalized = command.strip()
+        lower = normalized.lower()
+
+        if lower in {"df", "df -h"}:
+            return AIAgent._as_windows_powershell("Get-PSDrive -PSProvider FileSystem")
+
+        if lower in {"free", "free -h"}:
+            return AIAgent._as_windows_powershell(
+                "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory"
+            )
+
+        if lower in {"ps", "ps aux"}:
+            return AIAgent._as_windows_powershell(
+                "Get-Process | Sort-Object CPU -Descending | Select-Object -First 30"
+            )
+
+        if lower in {"top", "htop"}:
+            return AIAgent._as_windows_powershell(
+                "Get-Process | Sort-Object CPU -Descending | Select-Object -First 20 Name,Id,CPU,WS"
+            )
+
+        if lower in {"uname", "uname -a"}:
+            return AIAgent._as_windows_powershell(
+                "$os = Get-CimInstance Win32_OperatingSystem; Write-Output \"$($os.Caption) $($os.Version)\""
+            )
+
+        return command
 
     def _tool_read_file(self, args: dict) -> str:
         raw_path = args.get("path", "").strip()

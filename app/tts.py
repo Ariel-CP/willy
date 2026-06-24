@@ -5,6 +5,7 @@ Runs in a background thread so the GUI never blocks.
 
 import math
 import os
+import platform
 import re
 import shutil
 import struct
@@ -29,6 +30,8 @@ def _strip_for_speech(text: str) -> str:
 
 
 def _check_available() -> bool:
+    if platform.system() == "Windows":
+        return shutil.which("powershell") is not None or shutil.which("pwsh") is not None
     has_playback = shutil.which("pw-play") is not None
     has_espeak = shutil.which("espeak") is not None
     has_piper = shutil.which("piper") is not None
@@ -138,6 +141,8 @@ class TTSEngine:
         self._thread: Optional[threading.Thread] = None
 
         self._config: dict = config or {}
+        self._is_windows = platform.system() == "Windows"
+        self._powershell_cmd = shutil.which("powershell") or shutil.which("pwsh")
         self._pwplay_cmd = shutil.which("pw-play")
         self._espeak_cmd = shutil.which("espeak")
         self._piper_cmd = shutil.which("piper")
@@ -147,7 +152,7 @@ class TTSEngine:
                 self._piper_cmd = local_piper
 
         self._engine_preference = str(self._config.get("tts_engine", "auto")).strip().lower()
-        if self._engine_preference not in {"auto", "espeak", "piper"}:
+        if self._engine_preference not in {"auto", "espeak", "piper", "sapi"}:
             self._engine_preference = "auto"
 
         senior_default = True
@@ -176,6 +181,8 @@ class TTSEngine:
         self._available = self._check_runtime_available()
 
     def _check_runtime_available(self) -> bool:
+        if self._is_windows:
+            return self._can_use_sapi() or self._can_use_piper()
         if not self._pwplay_cmd:
             return False
         return self._can_use_espeak() or self._can_use_piper()
@@ -190,16 +197,41 @@ class TTSEngine:
             return False
         return os.path.isfile(self._piper_model)
 
+    def _can_use_sapi(self) -> bool:
+        return self._powershell_cmd is not None
+
     def _resolve_engine(self) -> Optional[str]:
         if self._engine_preference == "piper":
-            return "piper" if self._can_use_piper() else ("espeak" if self._can_use_espeak() else None)
+            if self._can_use_piper():
+                return "piper"
+            if self._can_use_espeak():
+                return "espeak"
+            if self._can_use_sapi():
+                return "sapi"
+            return None
         if self._engine_preference == "espeak":
-            return "espeak" if self._can_use_espeak() else ("piper" if self._can_use_piper() else None)
+            if self._can_use_espeak():
+                return "espeak"
+            if self._can_use_piper():
+                return "piper"
+            if self._can_use_sapi():
+                return "sapi"
+            return None
+        if self._engine_preference == "sapi":
+            if self._can_use_sapi():
+                return "sapi"
+            if self._can_use_piper():
+                return "piper"
+            if self._can_use_espeak():
+                return "espeak"
+            return None
         # auto: prefer piper when configured, then espeak
         if self._can_use_piper():
             return "piper"
         if self._can_use_espeak():
             return "espeak"
+        if self._can_use_sapi():
+            return "sapi"
         return None
 
     def is_available(self) -> bool:
@@ -272,11 +304,24 @@ class TTSEngine:
         return bands_series, chunk_duration
 
     def _play_wav_file(self, path: str) -> None:
-        proc = subprocess.Popen(
-            ["pw-play", path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        if self._is_windows and self._powershell_cmd:
+            escaped_path = path.replace("'", "''")
+            cmd = (
+                "$ErrorActionPreference='Stop'; "
+                f"$player = New-Object System.Media.SoundPlayer '{escaped_path}'; "
+                "$player.PlaySync()"
+            )
+            proc = subprocess.Popen(
+                [self._powershell_cmd, "-NoProfile", "-Command", cmd],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            proc = subprocess.Popen(
+                ["pw-play", path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         with self._lock:
             self._proc = proc
         proc.wait()
@@ -331,12 +376,41 @@ class TTSEngine:
         if proc.returncode != 0:
             raise RuntimeError("Piper synthesis failed")
 
+    def _synthesize_sapi(self, text: str, wav_path: str, volume: float) -> None:
+        if not self._powershell_cmd:
+            raise RuntimeError("PowerShell is not available for SAPI synthesis")
+
+        escaped_text = text.replace("'", "''")
+        escaped_path = wav_path.replace("'", "''")
+        rate = max(-8, min(8, int(round((self._rate - 1.0) * 10))))
+        speak_volume = max(0, min(100, int(round(volume * 100))))
+
+        cmd = (
+            "$ErrorActionPreference='Stop'; "
+            "Add-Type -AssemblyName System.Speech; "
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"$s.Rate = {rate}; "
+            f"$s.Volume = {speak_volume}; "
+            f"$s.SetOutputToWaveFile('{escaped_path}'); "
+            f"$s.Speak('{escaped_text}'); "
+            "$s.Dispose()"
+        )
+        subprocess.run(
+            [self._powershell_cmd, "-NoProfile", "-Command", cmd],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     def _synthesize_to_wav(self, engine: str, text: str, wav_path: str, volume: float) -> None:
         if engine == "piper":
             self._synthesize_piper(text, wav_path)
             return
         if engine == "espeak":
             self._synthesize_espeak(text, wav_path, volume)
+            return
+        if engine == "sapi":
+            self._synthesize_sapi(text, wav_path, volume)
             return
         raise RuntimeError(f"Unknown TTS engine: {engine}")
 
@@ -372,11 +446,24 @@ class TTSEngine:
 
             energies, chunk_duration = self._wave_energy_series(speech_wav)
 
-            proc = subprocess.Popen(
-                ["pw-play", speech_wav],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            if self._is_windows and self._powershell_cmd:
+                escaped_path = speech_wav.replace("'", "''")
+                play_cmd = (
+                    "$ErrorActionPreference='Stop'; "
+                    f"$player = New-Object System.Media.SoundPlayer '{escaped_path}'; "
+                    "$player.PlaySync()"
+                )
+                proc = subprocess.Popen(
+                    [self._powershell_cmd, "-NoProfile", "-Command", play_cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                proc = subprocess.Popen(
+                    ["pw-play", speech_wav],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             with self._lock:
                 self._proc = proc
 

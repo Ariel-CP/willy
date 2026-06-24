@@ -1,4 +1,5 @@
 from app.ai_agent import AIAgent
+from unittest.mock import patch
 
 
 class DummyTM:
@@ -111,3 +112,31 @@ def test_resolve_project_env_falls_back_to_project_default() -> None:
 
     assert env == "esp32dev"
     assert "project default" in note.lower()
+
+
+def test_normalize_command_translates_df_on_windows() -> None:
+    with patch("app.ai_agent.platform.system", return_value="Windows"):
+        normalized = AIAgent._normalize_command_for_platform("df -h")
+        assert "powershell -NoProfile -Command" in normalized
+        assert "Get-PSDrive -PSProvider FileSystem" in normalized
+
+
+def test_normalize_command_translates_free_on_windows() -> None:
+    with patch("app.ai_agent.platform.system", return_value="Windows"):
+        normalized = AIAgent._normalize_command_for_platform("free -h")
+        assert "powershell -NoProfile -Command" in normalized
+        assert "Get-CimInstance Win32_OperatingSystem" in normalized
+
+
+def test_normalize_command_translates_ps_on_windows() -> None:
+    with patch("app.ai_agent.platform.system", return_value="Windows"):
+        normalized = AIAgent._normalize_command_for_platform("ps aux")
+        assert "powershell -NoProfile -Command" in normalized
+        assert "Get-Process" in normalized
+
+
+def test_normalize_command_translates_uname_on_windows() -> None:
+    with patch("app.ai_agent.platform.system", return_value="Windows"):
+        normalized = AIAgent._normalize_command_for_platform("uname -a")
+        assert "powershell -NoProfile -Command" in normalized
+        assert "Win32_OperatingSystem" in normalized

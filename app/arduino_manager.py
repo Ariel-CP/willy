@@ -9,6 +9,7 @@ import subprocess
 import json
 import re
 import os
+import sys
 from typing import Dict, List, Optional, Callable, Tuple
 from pathlib import Path
 
@@ -58,14 +59,24 @@ class ArduinoManager:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
         
-        # Try common installation paths
-        common_paths = [
-            Path.home() / ".local" / "bin" / "pio",
-            Path("/usr/local/bin/pio"),
-            Path("/usr/bin/pio"),
-        ]
+        # Try common installation paths by OS
+        if sys.platform == "win32":
+            appdata = os.environ.get("APPDATA", "")
+            local_appdata = os.environ.get("LOCALAPPDATA", "")
+            common_paths = [
+                Path(appdata) / "Python" / "Scripts" / "pio.exe" if appdata else None,
+                Path(local_appdata) / "Programs" / "Python" / "Python311" / "Scripts" / "pio.exe" if local_appdata else None,
+                Path(local_appdata) / "Programs" / "Python" / "Python312" / "Scripts" / "pio.exe" if local_appdata else None,
+            ]
+        else:
+            common_paths = [
+                Path.home() / ".local" / "bin" / "pio",
+                Path("/usr/local/bin/pio"),
+                Path("/usr/bin/pio"),
+            ]
+
         for path in common_paths:
-            if path.exists():
+            if path and path.exists():
                 self.platformio_path = str(path)
                 return
         

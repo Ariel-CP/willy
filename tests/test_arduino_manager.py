@@ -1,12 +1,15 @@
 from pathlib import Path
 import os
+import sys
+from unittest.mock import patch
 
 from app.arduino_manager import ArduinoManager
 
 
 def _mgr() -> ArduinoManager:
     # Use an existing binary path to avoid noisy platform detection errors in tests.
-    return ArduinoManager({"platformio_path": "/bin/echo"})
+    fallback_bin = "C:\\Windows\\System32\\cmd.exe" if sys.platform == "win32" else "/bin/echo"
+    return ArduinoManager({"platformio_path": fallback_bin})
 
 
 def test_parse_platformio_multiline_output_detects_uno() -> None:
@@ -156,3 +159,19 @@ def test_build_blocks_on_preflight_failure(tmp_path: Path) -> None:
 
     assert result["ok"] is False
     assert "preflight failed" in result["error"].lower()
+
+
+def test_detect_platformio_uses_windows_common_paths() -> None:
+    def fake_exists(path_obj) -> bool:
+        return str(path_obj).lower().endswith("python\\scripts\\pio.exe")
+
+    with patch("app.arduino_manager.sys.platform", "win32"), patch.dict(
+        "app.arduino_manager.os.environ",
+        {"APPDATA": "C:\\Users\\tester\\AppData\\Roaming", "LOCALAPPDATA": ""},
+        clear=False,
+    ), patch("app.arduino_manager.subprocess.run", side_effect=FileNotFoundError), patch(
+        "app.arduino_manager.Path.exists", fake_exists
+    ):
+        mgr = ArduinoManager({})
+        assert mgr.platformio_path is not None
+        assert mgr.platformio_path.lower().endswith("python\\scripts\\pio.exe")

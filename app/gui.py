@@ -582,7 +582,8 @@ class WillyApp(ctk.CTk):
                     distro = f" ({_d.name(pretty=True)})"
                 except ImportError:
                     try:
-                        distro = f" ({platform.freedesktop_os_release().get('PRETTY_NAME', '')})"
+                        if hasattr(platform, "freedesktop_os_release"):
+                            distro = f" ({platform.freedesktop_os_release().get('PRETTY_NAME', '')})"
                     except Exception:
                         pass
             username = os.environ.get("USER") or os.environ.get("USERNAME") or "desconocido"
