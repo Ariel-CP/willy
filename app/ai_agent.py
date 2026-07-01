@@ -8,6 +8,7 @@ import os
 import platform
 import threading
 import time
+import logging
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -17,6 +18,9 @@ from typing import Callable, Optional
 import openai
 from app import i18n
 from app.iot_diagram_manager import IoTDiagramManager
+
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Tool schemas
@@ -284,6 +288,36 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "scan_i2c_bus",
+            "description": "Run an automatic I2C scan on a connected microcontroller (compile/upload scanner + serial readback).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to the PlatformIO project directory.",
+                    },
+                    "port": {
+                        "type": "string",
+                        "description": "Optional serial port (e.g., COM5 or /dev/ttyUSB0). If omitted, auto-detect first board.",
+                    },
+                    "env": {
+                        "type": "string",
+                        "description": "Optional PlatformIO environment (e.g., uno).",
+                    },
+                    "monitor_seconds": {
+                        "type": "integer",
+                        "description": "How long to listen on serial monitor for scan output.",
+                        "default": 8,
+                    },
+                },
+                "required": ["project_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_iot_schematic",
             "description": "Generate an IoT electronic schematic diagram (PNG/SVG) and BOM from components and connections.",
             "parameters": {
@@ -330,18 +364,14 @@ TOOLS = [
     },
 ]
 
-def _build_system_prompt() -> str:
-    os_name = platform.system() or "Unknown"
-    terminal_hint = (
-        "PowerShell/Windows shell"
-        if os_name == "Windows"
-        else ("Unix shell (Linux/macOS)" if os_name in {"Linux", "Darwin"} else "system shell")
-    )
+SYSTEM_PROMPT_TEMPLATE = """You are Willy, an intelligent AI assistant and IoT programming specialist fully integrated with the user's terminal.
 
-    return f"""You are Willy, an intelligent AI assistant and IoT programming specialist fully integrated with the user's terminal.
+Runtime context:
+- Operating System: {os_name}
+- OS Version: {os_version}
+- Platform: {platform_name}
 
-Current host OS: {os_name}
-Expected shell style: {terminal_hint}
+You MUST adapt commands and instructions to this runtime OS. Do not suggest Linux-only commands on Windows, and do not suggest PowerShell-only commands on Linux.
 
 You have access to the following tools:
 
@@ -370,6 +400,8 @@ Guidelines:
     - Disk usage: `df -h` (Linux/macOS) -> `powershell -NoProfile -Command "Get-PSDrive -PSProvider FileSystem"` (Windows)
     - Memory usage: `free -h` (Linux/macOS) -> `powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory"` (Windows)
     - Process list: `ps aux` (Linux/macOS) -> `powershell -NoProfile -Command "Get-Process | Sort-Object CPU -Descending | Select-Object -First 30"` (Windows)
+- For PlatformIO dependency issues (e.g., LiquidCrystal_I2C), keep the flow automatic in PlatformIO and do NOT suggest manual Arduino IDE steps unless the user explicitly asks for Arduino IDE instructions.
+- For PlatformIO dependency issues (e.g., LiquidCrystal_I2C), keep the flow automatic in PlatformIO and do NOT suggest manual Arduino IDE steps unless the user explicitly asks for Arduino IDE instructions.
 - For commands that could be destructive (rm, sudo, overwriting files, etc.), briefly explain what you are about to do before the tool call. The UI will ask the user for confirmation.
 - For read-only operations (ls, cat, pwd, search_web, fetch_webpage, detect_microcontroller, etc.) you can proceed directly.
 - Always show relevant command or tool output to the user in your response.
@@ -474,16 +506,27 @@ class AIAgent:
         self.arduino_manager = arduino_manager
         self.on_file_written = on_file_written
         self.on_schematic_generated = on_schematic_generated
-        self.diagram_manager = IoTDiagramManager(base_dir=os.path.dirname(os.path.dirname(__file__)))
-        self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.diagram_manager = IoTDiagramManager(
+            base_dir=os.path.dirname(os.path.dirname(__file__))
+        )
+        self.runtime_context = self._detect_runtime_context()
+        self.system_prompt = self._build_system_prompt()
+        self.history: list[dict] = [
+            {"role": "system", "content": self.system_prompt}
+        ]
         self._client: Optional[openai.OpenAI] = None
-        
+
         # Plan mode state
         self.plan_steps: list[str] = []
         self.awaiting_plan_confirmation = False
         self.queued_commands: list[dict] = []
         self.skip_confirmations_until = None  # Unix timestamp or None
         self._progress_value = 0.0
+        self._last_assistant_text = ""
+        self._last_assistant_ts = 0.0
+        self._last_success_project_path = ""
+        self._last_success_port = ""
+        self._last_success_env = ""
 
     def _emit_progress(self, percent: float, detail: str = "") -> None:
         """Send monotonic progress updates to the UI (0-100)."""
@@ -512,7 +555,21 @@ class AIAgent:
         threading.Thread(target=self._process, args=(user_text,), daemon=True).start()
 
     def clear_history(self) -> None:
-        self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.runtime_context = self._detect_runtime_context()
+        self.system_prompt = self._build_system_prompt()
+        self.history = [{"role": "system", "content": self.system_prompt}]
+
+    def _detect_runtime_context(self) -> dict[str, str]:
+        """Detect runtime OS details so the model can adapt commands."""
+        return {
+            "os_name": platform.system() or "Unknown",
+            "os_version": platform.release() or "Unknown",
+            "platform_name": platform.platform() or "Unknown",
+        }
+
+    def _build_system_prompt(self) -> str:
+        """Build a system prompt with runtime OS context."""
+        return SYSTEM_PROMPT_TEMPLATE.format(**self.runtime_context)
 
     # ------------------------------------------------------------------
     # Core loop
@@ -623,6 +680,8 @@ class AIAgent:
         self.on_status(i18n.get("ai_thinking"))
         self._progress_value = 0.0
         self._emit_progress(5, "Analizando solicitud")
+        tool_attempts: dict[str, int] = {}
+        failed_tool_fingerprints: set[str] = set()
         try:
             client = self._get_client()
             model = self.config.get("model", "gpt-4o")
@@ -650,7 +709,7 @@ class AIAgent:
                     ):
                         recovered_bad_history = True
                         self.history = [
-                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "system", "content": self.system_prompt},
                             {"role": "user", "content": user_text},
                         ]
                         self.on_message(
@@ -665,6 +724,10 @@ class AIAgent:
 
                 # Check for plan in assistant's response
                 assistant_text = msg.content or ""
+                assistant_text = self._sanitize_assistant_text(
+                    assistant_text,
+                    user_text,
+                )
                 is_plan_text = False
                 plan_cancelled = False
                 if assistant_text:
@@ -673,7 +736,7 @@ class AIAgent:
                 if assistant_text and is_plan_text:
                     self._emit_progress(25, "Plan detectado")
                     # Show the plan message first
-                    self.on_message("assistant", assistant_text)
+                    self._emit_assistant_once(assistant_text)
                     
                     # Extract plan steps
                     plan_steps = self._extract_plan_steps(assistant_text)
@@ -709,6 +772,21 @@ class AIAgent:
                     for idx, tc in enumerate(msg.tool_calls, start=1):
                         step_pct = 35 + (idx / total_calls) * 55
                         self._emit_progress(step_pct, f"Ejecutando: {tc.function.name}")
+                        fingerprint = self._tool_call_fingerprint(tc)
+                        tool_attempts[fingerprint] = tool_attempts.get(fingerprint, 0) + 1
+
+                        if fingerprint in failed_tool_fingerprints:
+                            result = (
+                                "Blocked repeated tool call: la misma llamada ya fallo en este turno. "
+                                "Ajusta project_path/port/env o aplica otra estrategia antes de reintentar."
+                            )
+                            self.history.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": result,
+                            })
+                            continue
+
                         try:
                             result = self._dispatch_tool(tc)
                         except Exception as exc:  # noqa: BLE001
@@ -718,6 +796,10 @@ class AIAgent:
                                 "error": repr(exc),
                             })
                             result = f"Error executing tool '{tc.function.name}': {exc}"
+
+                        if self._tool_result_is_failure(result):
+                            failed_tool_fingerprints.add(fingerprint)
+
                         self.history.append({
                             "role": "tool",
                             "tool_call_id": tc.id,
@@ -729,7 +811,7 @@ class AIAgent:
 
                 # No tool calls — final text response
                 if assistant_text and not is_plan_text:
-                    self.on_message("assistant", assistant_text)
+                    self._emit_assistant_once(assistant_text)
                 self._emit_progress(100, "Completado")
                 break
 
@@ -747,6 +829,90 @@ class AIAgent:
             self._emit_progress(100, "Completado con error")
         finally:
             self.on_status("")
+
+    def _sanitize_assistant_text(self, text: str, user_text: str) -> str:
+        """Prevent unsolicited manual dependency-install fallbacks in assistant output."""
+        if not text:
+            return text
+
+        text_l = text.lower()
+        user_l = (user_text or "").lower()
+
+        user_explicitly_wants_ide = (
+            "arduino ide" in user_l
+            or "manual" in user_l
+            or "zip" in user_l
+        )
+        if user_explicitly_wants_ide:
+            return text
+
+        has_manual_ide_flow = (
+            "arduino ide" in text_l
+            and (
+                "manage libraries" in text_l
+                or "include library" in text_l
+                or "añadir biblioteca" in text_l
+                or "sketch" in text_l
+            )
+        )
+        has_manual_platformio_dep_flow = (
+            "platformio.ini" in text_l
+            or "carpeta `lib`" in text_l
+            or "carpeta lib" in text_l
+            or "descargar la librer" in text_l
+            or "instalar la librer" in text_l
+            or "agrega la linea" in text_l
+            or "añade la linea" in text_l
+        )
+        has_dependency_context = (
+            "liquidcrystal_i2c" in text_l
+            or "librer" in text_l
+            or "dependency" in text_l
+            or "platformio" in text_l
+        )
+
+        if (has_manual_ide_flow or has_manual_platformio_dep_flow) and has_dependency_context:
+            return (
+                "Willy mantendra un flujo automatico con PlatformIO (sin pasos manuales en IDE externo).\n"
+                "Si la dependencia falla, aplicara correccion de alias, reintentos y fallback de version automaticamente, "
+                "y mostrara el error tecnico final para diagnostico."
+            )
+
+        return text
+
+    def _emit_assistant_once(self, text: str, dedupe_window_seconds: float = 10.0) -> None:
+        """Emit assistant text, skipping immediate exact duplicates."""
+        msg = (text or "").strip()
+        if not msg:
+            return
+
+        now = time.time()
+        if msg == self._last_assistant_text and (now - self._last_assistant_ts) <= dedupe_window_seconds:
+            logger.info("Skipping duplicate assistant message within dedupe window")
+            return
+
+        self._last_assistant_text = msg
+        self._last_assistant_ts = now
+        self.on_message("assistant", text)
+
+    def _tool_call_fingerprint(self, tool_call) -> str:
+        """Create a stable fingerprint from tool name + normalized arguments."""
+        name = tool_call.function.name
+        try:
+            parsed_args = json.loads(tool_call.function.arguments or "{}")
+            normalized_args = json.dumps(parsed_args, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            normalized_args = str(tool_call.function.arguments or "")
+        return f"{name}:{normalized_args}"
+
+    def _tool_result_is_failure(self, result_text: str) -> bool:
+        """Best-effort check to flag failed tool results and stop blind repeats."""
+        text = (result_text or "").strip().lower()
+        if not text:
+            return False
+        if text.startswith("✓"):
+            return False
+        return text.startswith("✗") or text.startswith("error") or " failed" in text
 
     # ------------------------------------------------------------------
     # Tool dispatcher
@@ -772,6 +938,7 @@ class AIAgent:
             "build_microcontroller": self._tool_build_microcontroller,
             "upload_microcontroller": self._tool_upload_microcontroller,
             "flash_sketch_file": self._tool_flash_sketch_file,
+            "scan_i2c_bus": self._tool_scan_i2c_bus,
             "generate_iot_schematic": self._tool_generate_iot_schematic,
         }
         handler = dispatch.get(name)
@@ -1092,6 +1259,45 @@ class AIAgent:
             return path
         return os.path.normpath(os.path.join(self.tm.get_cwd(), path))
 
+    def _is_platformio_project_dir(self, path: str) -> bool:
+        candidate = (path or "").strip()
+        if not candidate:
+            return False
+        return os.path.exists(os.path.join(candidate, "platformio.ini"))
+
+    def _resolve_iot_project_path(self, raw_project_path: str) -> tuple[str, str]:
+        """Resolve project path for IoT tools using successful context and config defaults."""
+        raw = (raw_project_path or "").strip()
+
+        if raw and raw not in {".", "./", ".\\"}:
+            return self._resolve_path(raw), ""
+
+        candidates = [
+            self._last_success_project_path,
+            str(self.config.get("initial_directory", "")).strip(),
+            self.tm.get_cwd(),
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            resolved = self._resolve_path(candidate)
+            if self._is_platformio_project_dir(resolved):
+                note = f"Auto-context: usando proyecto {resolved}."
+                return resolved, note
+
+        if raw:
+            return self._resolve_path(raw), ""
+        return "", ""
+
+    def _remember_iot_success(self, project_path: str, env: str = "", port: str = "") -> None:
+        """Keep last successful IoT context to preserve deterministic flows."""
+        if project_path:
+            self._last_success_project_path = project_path
+        if env:
+            self._last_success_env = env
+        if port:
+            self._last_success_port = port
+
     def _normalize_url(self, raw_url: str) -> str:
         if raw_url.startswith(("http://", "https://")):
             return raw_url
@@ -1260,36 +1466,86 @@ class AIAgent:
         """Build/compile a PlatformIO project."""
         if not self.arduino_manager:
             return "Error: Arduino support not available."
-        
-        project_path = args.get("project_path", "").strip()
+
+        project_path, project_note = self._resolve_iot_project_path(
+            args.get("project_path", "")
+        )
         if not project_path:
             return "Error: project_path is required."
         
         env_arg = args.get("env")
         env, env_note = self._resolve_project_env(project_path, requested_env=env_arg)
+        logger.info(
+            "Tool build_microcontroller: project=%s requested_env=%s resolved_env=%s",
+            project_path,
+            env_arg or "",
+            env or "default",
+        )
         
         try:
             result = self.arduino_manager.build_sketch(project_path, env)
             if result["ok"]:
+                self._remember_iot_success(project_path=project_path, env=env or "")
+                logger.info("Tool build_microcontroller: success env=%s", env or "default")
                 if env_note:
+                    if project_note:
+                        return f"✓ Build successful\n{project_note}\n{env_note}\n\n{result['output']}"
                     return f"✓ Build successful\n{env_note}\n\n{result['output']}"
+                if project_note:
+                    return f"✓ Build successful\n{project_note}\n\n{result['output']}"
                 return f"✓ Build successful\n\n{result['output']}"
             else:
+                logger.warning(
+                    "Tool build_microcontroller: failed env=%s error=%s",
+                    env or "default",
+                    result.get("error", ""),
+                )
+                output_text = result.get("output", "")
+                error_text = result.get("error", "")
+                auto_note = self._auto_recovery_note(output_text, error_text)
+                flow_note = self._platformio_dependency_flow_note()
+                technical_error = self._final_technical_error(error_text, output_text)
                 if env_note:
-                    return f"✗ Build failed: {result['error']}\n{env_note}\n\n{result['output']}"
-                return f"✗ Build failed: {result['error']}\n\n{result['output']}"
+                    return (
+                        f"✗ Build failed: {result['error']}\n"
+                        f"{project_note}\n"
+                        f"{flow_note}\n"
+                        f"{auto_note}\n"
+                        f"Error tecnico final: {technical_error}\n"
+                        f"{env_note}\n\n"
+                        f"{result['output']}"
+                    )
+                if project_note:
+                    return (
+                        f"✗ Build failed: {result['error']}\n"
+                        f"{project_note}\n"
+                        f"{flow_note}\n"
+                        f"{auto_note}\n\n"
+                        f"Error tecnico final: {technical_error}\n\n"
+                        f"{result['output']}"
+                    )
+                return (
+                    f"✗ Build failed: {result['error']}\n"
+                    f"{flow_note}\n"
+                    f"{auto_note}\n\n"
+                    f"Error tecnico final: {technical_error}\n\n"
+                    f"{result['output']}"
+                )
         except Exception as exc:
+            logger.exception("Tool build_microcontroller exception")
             return f"Error building microcontroller project: {exc}"
     
     def _tool_upload_microcontroller(self, args: dict) -> str:
         """Build and upload firmware to microcontroller."""
         if not self.arduino_manager:
             return "Error: Arduino support not available."
-        
-        project_path = args.get("project_path", "").strip()
+
+        project_path, project_note = self._resolve_iot_project_path(
+            args.get("project_path", "")
+        )
         port = (args.get("port") or "").strip()
         env_arg = args.get("env")
-        
+
         if not project_path:
             return "Error: project_path is required."
 
@@ -1302,12 +1558,19 @@ class AIAgent:
                 port = ""
 
         if not port:
-            port = self.config.get("default_port", "/dev/ttyUSB0")
+            port = self._last_success_port or self.config.get("default_port", "/dev/ttyUSB0")
         
         env, env_note = self._resolve_project_env(
             project_path,
             requested_env=env_arg,
             port=port,
+        )
+        logger.info(
+            "Tool upload_microcontroller: project=%s port=%s requested_env=%s resolved_env=%s",
+            project_path,
+            port,
+            env_arg or "",
+            env or "default",
         )
 
         # Ask for confirmation
@@ -1321,6 +1584,7 @@ class AIAgent:
         self.on_confirm(
             "Upload firmware?",
             f"Project: {project_path}\nPort: {port}\nEnvironment: {env or '(auto)'}"
+            + (f"\n{project_note}" if project_note else "")
             + (f"\n{env_note}" if env_note else ""),
             on_decision,
         )
@@ -1331,11 +1595,157 @@ class AIAgent:
         try:
             result = self.arduino_manager.upload_firmware(project_path, port, env)
             if result["ok"]:
+                self._remember_iot_success(project_path=project_path, env=env or "", port=port)
+                logger.info("Tool upload_microcontroller: success env=%s port=%s", env or "default", port)
+                if project_note:
+                    return f"✓ Firmware uploaded successfully\n{project_note}\n\n{result['output']}"
                 return f"✓ Firmware uploaded successfully\n\n{result['output']}"
             else:
-                return f"✗ Upload failed: {result['error']}\n\n{result['output']}"
+                logger.warning(
+                    "Tool upload_microcontroller: failed env=%s port=%s error=%s",
+                    env or "default",
+                    port,
+                    result.get("error", ""),
+                )
+                output_text = result.get("output", "")
+                error_text = result.get("error", "")
+                auto_note = self._auto_recovery_note(output_text, error_text)
+                flow_note = self._platformio_dependency_flow_note()
+                technical_error = self._final_technical_error(error_text, output_text)
+                return (
+                    f"✗ Upload failed: {result['error']}\n"
+                    f"{project_note}\n"
+                    f"{flow_note}\n"
+                    f"{auto_note}\n\n"
+                    f"Error tecnico final: {technical_error}\n\n"
+                    f"{result['output']}"
+                )
         except Exception as exc:
+            logger.exception("Tool upload_microcontroller exception")
             return f"Error uploading firmware: {exc}"
+
+    def _tool_scan_i2c_bus(self, args: dict) -> str:
+        """Compile/upload a temporary scanner and read I2C addresses from serial output."""
+        if not self.arduino_manager:
+            return "Error: Arduino support not available."
+
+        project_path, project_note = self._resolve_iot_project_path(
+            args.get("project_path", "")
+        )
+        if not project_path:
+            return "Error: project_path is required."
+
+        port = (args.get("port") or "").strip()
+        env_arg = args.get("env")
+        monitor_seconds = int(args.get("monitor_seconds", 8) or 8)
+
+        if not port:
+            try:
+                devices = self.arduino_manager.detect_microcontrollers()
+                if devices:
+                    port = str(devices[0].get("port", "")).strip()
+            except Exception:
+                port = ""
+
+        if not port:
+            port = self._last_success_port or ""
+
+        if not port:
+            return "Error: no se detecto puerto serial para escaneo I2C."
+
+        env, env_note = self._resolve_project_env(
+            project_path,
+            requested_env=env_arg,
+            port=port,
+        )
+
+        logger.info(
+            "Tool scan_i2c_bus: project=%s port=%s env=%s monitor_seconds=%s",
+            project_path,
+            port,
+            env or "default",
+            monitor_seconds,
+        )
+
+        try:
+            result = self.arduino_manager.scan_i2c_bus(
+                project_path=project_path,
+                port=port,
+                env=env,
+                monitor_seconds=monitor_seconds,
+            )
+            if not result.get("ok"):
+                return (
+                    f"✗ I2C scan failed: {result.get('error', 'unknown error')}\n"
+                    f"{project_note}\n"
+                    f"{result.get('output', '')}"
+                ).strip()
+
+            addresses = result.get("addresses", [])
+            self._remember_iot_success(project_path=project_path, env=env or "", port=port)
+            if addresses:
+                addresses_line = ", ".join(addresses)
+                return (
+                    f"✓ I2C scan completado en {port}\n"
+                    f"Direcciones detectadas: {addresses_line}\n"
+                    f"{project_note}\n"
+                    f"{env_note}\n\n"
+                    f"Salida serial:\n{result.get('output', '').strip()}"
+                ).strip()
+
+            return (
+                f"✓ I2C scan completado en {port}\n"
+                f"No se detectaron dispositivos I2C en el rango estandar.\n"
+                f"{project_note}\n"
+                f"{env_note}\n\n"
+                f"Salida serial:\n{result.get('output', '').strip()}"
+            ).strip()
+        except Exception as exc:
+            logger.exception("Tool scan_i2c_bus exception")
+            return f"Error scanning I2C bus: {exc}"
+
+    def _platformio_dependency_flow_note(self) -> str:
+        return (
+            "Willy mantendra un flujo automatico con PlatformIO (sin pasos manuales en IDE externo).\n"
+            "Si la dependencia falla, aplicara correccion de alias, reintentos y fallback de version automaticamente, "
+            "y mostrara el error tecnico final para diagnostico."
+        )
+
+    def _final_technical_error(self, error: str, output: str) -> str:
+        """Return a concise final technical error line for diagnostics."""
+        merged = f"{error}\n{output}"
+        lines = [ln.strip() for ln in merged.splitlines() if ln.strip()]
+        if not lines:
+            return "No se pudo extraer detalle tecnico del fallo."
+
+        keywords = (
+            "error",
+            "failed",
+            "not found",
+            "unknown package",
+            "incompatible",
+            "timeout",
+            "dependency",
+            "package install",
+        )
+        for line in reversed(lines):
+            line_l = line.lower()
+            if any(k in line_l for k in keywords):
+                return line[:300]
+
+        return lines[-1][:300]
+
+    def _auto_recovery_note(self, output: str, error: str) -> str:
+        """Return a short guidance note focused on automatic recovery flow."""
+        text = f"{output}\n{error}".lower()
+        if "automatic" in text or "auto-fix" in text or "retry" in text:
+            return "Willy aplico recuperacion automatica de dependencias antes de fallar."
+        if "package install" in text or "dependency" in text or "library" in text:
+            return (
+                "Willy intento resolver dependencias automaticamente; "
+                "revisa el detalle para la causa exacta."
+            )
+        return "Willy mantuvo flujo automatico sin pasos manuales externos."
 
     def _tool_flash_sketch_file(self, args: dict) -> str:
         """Prepare project from .ino, then compile and upload in one flow."""
