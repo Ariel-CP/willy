@@ -442,9 +442,6 @@ Limits for safety:
 - Always summarize what was executed after completion
 """
 
-
-SYSTEM_PROMPT = _build_system_prompt()
-
 LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "willy_tool_errors.log")
 
 
