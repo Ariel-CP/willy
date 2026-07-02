@@ -6,6 +6,7 @@ Clicking a file sends its path to the chat panel.
 import os
 import shutil
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import customtkinter as ctk
@@ -14,10 +15,25 @@ from app import i18n
 
 
 class FileBrowser(ctk.CTkFrame):
-    def __init__(self, master, on_file_selected: Callable[[str], None], **kwargs):
+    def __init__(
+        self,
+        master,
+        on_file_selected: Callable[[str], None],
+        initial_path: str = "~",
+        **kwargs,
+    ):
         super().__init__(master, **kwargs)
         self._on_file_selected = on_file_selected
-        self._root_path = os.path.expanduser("~")
+        self._tree_style_name = "Willy.Treeview"
+        self._v_scroll_style_name = "Willy.Tree.Vertical.TScrollbar"
+        self._h_scroll_style_name = "Willy.Tree.Horizontal.TScrollbar"
+        self._tree_content_width = 320
+        self._tree_text_font = tkfont.Font(family="Segoe UI", size=11)
+        candidate = os.path.expanduser(initial_path)
+        if os.path.isdir(candidate):
+            self._root_path = candidate
+        else:
+            self._root_path = os.path.expanduser("~")
         self._build_ui()
         self._populate(self._root_path)
 
@@ -28,17 +44,18 @@ class FileBrowser(ctk.CTkFrame):
     def _build_ui(self) -> None:
         self.grid_rowconfigure(2, weight=1)
         self.grid_columnconfigure(0, weight=1)
+        self._configure_tree_style()
 
         # Header
-        header = ctk.CTkFrame(self, height=36, fg_color=("gray82", "gray18"))
+        header = ctk.CTkFrame(self, height=36, fg_color=("gray85", "gray20"))
         header.grid(row=0, column=0, sticky="ew")
         header.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
             header,
             text=i18n.get("files_header"),
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=("gray30", "gray80"),
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=("gray20", "#7ec8e3"),
         ).grid(row=0, column=0, padx=8, pady=6, sticky="w")
 
         ctk.CTkButton(
@@ -68,34 +85,113 @@ class FileBrowser(ctk.CTkFrame):
             self,
             text=self._root_path,
             font=ctk.CTkFont(family="monospace", size=9),
-            text_color=("gray50", "gray60"),
+            text_color=("gray45", "#8b949e"),
             anchor="w",
             wraplength=180,
         )
         self.path_label.grid(row=1, column=0, padx=8, pady=(2, 0), sticky="ew")
 
         # Tree frame
-        tree_outer = ctk.CTkFrame(self, fg_color=("gray94", "#0d1117"))
+        tree_outer = ctk.CTkFrame(self, fg_color=("gray96", "#0d1117"))
         tree_outer.grid(row=2, column=0, sticky="nsew", padx=0, pady=0)
         tree_outer.grid_rowconfigure(0, weight=1)
         tree_outer.grid_columnconfigure(0, weight=1)
 
-        self.tree = tk.ttk.Treeview(tree_outer, selectmode="browse")
+        self.tree = tk.ttk.Treeview(
+            tree_outer,
+            selectmode="browse",
+            style=self._tree_style_name,
+        )
+        self.tree.column("#0", anchor="w", stretch=False, width=self._tree_content_width)
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewOpen>>", self._on_tree_open)
         self.tree.bind("<Double-1>", self._on_double_click)
         self.tree.bind("<Return>", self._on_double_click)
         self.tree.bind("<Button-3>", self._on_right_click)
 
-        y_scroll = tk.Scrollbar(tree_outer, orient="vertical", command=self.tree.yview)
+        y_scroll = ttk.Scrollbar(
+            tree_outer,
+            orient="vertical",
+            command=self.tree.yview,
+            style=self._v_scroll_style_name,
+        )
         y_scroll.grid(row=0, column=1, sticky="ns")
-        x_scroll = tk.Scrollbar(tree_outer, orient="horizontal", command=self.tree.xview)
+        x_scroll = ttk.Scrollbar(
+            tree_outer,
+            orient="horizontal",
+            command=self.tree.xview,
+            style=self._h_scroll_style_name,
+        )
         x_scroll.grid(row=1, column=0, sticky="ew")
         self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.tree.bind("<MouseWheel>", self._on_mousewheel)
+        self.tree.bind("<Shift-MouseWheel>", self._on_shift_mousewheel)
+        self.tree.bind("<Button-4>", self._on_mousewheel)
+        self.tree.bind("<Button-5>", self._on_mousewheel)
 
         self._menu = tk.Menu(self, tearoff=0)
         self._menu.add_command(label="Crear carpeta", command=self._create_folder)
         self._menu.add_command(label="Mover", command=self._move_selected)
+
+    def _configure_tree_style(self) -> None:
+        """Match FileBrowser visuals to ChatPanel color language."""
+        appearance = ctk.get_appearance_mode().lower()
+        dark_mode = appearance == "dark"
+        style = ttk.Style(self)
+
+        # On Windows, native themes like "vista" ignore many Treeview color
+        # overrides. "clam" applies custom colors consistently.
+        if os.name == "nt" and style.theme_use() in {"vista", "xpnative"}:
+            style.theme_use("clam")
+
+        if dark_mode:
+            bg = "#0d1117"
+            fg = "#c9d1d9"
+            field_bg = "#0d1117"
+            selected_bg = "#1f6feb"
+            selected_fg = "#f0f6fc"
+            scroll_bg = "#0d1117"
+            scroll_trough = "#161b22"
+        else:
+            bg = "#f5f7fb"
+            fg = "#1f2937"
+            field_bg = "#f5f7fb"
+            selected_bg = "#bfdbfe"
+            selected_fg = "#0b2545"
+            scroll_bg = "#d1d5db"
+            scroll_trough = "#eef2f7"
+
+        style.configure(
+            self._tree_style_name,
+            background=bg,
+            foreground=fg,
+            fieldbackground=field_bg,
+            rowheight=26,
+            font=self._tree_text_font,
+        )
+        style.map(
+            self._tree_style_name,
+            background=[("selected", selected_bg)],
+            foreground=[("selected", selected_fg)],
+        )
+        style.layout(
+            self._tree_style_name,
+            [("Treeview.treearea", {"sticky": "nswe"})],
+        )
+        style.configure(
+            self._v_scroll_style_name,
+            background=scroll_bg,
+            troughcolor=scroll_trough,
+            bordercolor=scroll_trough,
+            arrowcolor=fg,
+        )
+        style.configure(
+            self._h_scroll_style_name,
+            background=scroll_bg,
+            troughcolor=scroll_trough,
+            bordercolor=scroll_trough,
+            arrowcolor=fg,
+        )
 
     # ------------------------------------------------------------------
     # Navigation
@@ -106,10 +202,12 @@ class FileBrowser(ctk.CTkFrame):
         self.path_label.configure(text=path)
         self.tree.delete(*self.tree.get_children())
         root_id = self.tree.insert("", "end", text=path, values=(path,), open=True)
+        self._reset_tree_width(path)
         self._populate_children(root_id, path)
 
     def _populate_children(self, node_id: str, path: str) -> None:
         self.tree.delete(*self.tree.get_children(node_id))
+        depth = self._node_depth(node_id) + 1
         try:
             names = sorted(
                 os.listdir(path),
@@ -121,7 +219,9 @@ class FileBrowser(ctk.CTkFrame):
         for name in names:
             full = os.path.join(path, name)
             icon = "[DIR]" if os.path.isdir(full) else "[FILE]"
-            child_id = self.tree.insert(node_id, "end", text=f"{icon} {name}", values=(full,))
+            label = f"{icon} {name}"
+            self._grow_tree_width(label, depth)
+            child_id = self.tree.insert(node_id, "end", text=label, values=(full,))
             if os.path.isdir(full):
                 # Placeholder for lazy loading
                 self.tree.insert(child_id, "end", text="...")
@@ -170,6 +270,47 @@ class FileBrowser(ctk.CTkFrame):
         if row:
             self.tree.selection_set(row)
         self._menu.post(event.x_root, event.y_root)
+
+    def _on_mousewheel(self, event) -> str:
+        """Scroll vertically with wheel on Windows/macOS/Linux."""
+        if getattr(event, "state", 0) & 0x0001:
+            return self._on_shift_mousewheel(event)
+
+        if hasattr(event, "num") and event.num in (4, 5):
+            delta = -1 if event.num == 4 else 1
+        else:
+            raw_delta = getattr(event, "delta", 0)
+            steps = max(1, abs(raw_delta) // 120) if raw_delta else 1
+            delta = -steps if raw_delta > 0 else steps
+        self.tree.yview_scroll(delta, "units")
+        return "break"
+
+    def _on_shift_mousewheel(self, event) -> str:
+        """Scroll horizontally with Shift + wheel."""
+        raw_delta = getattr(event, "delta", 0)
+        steps = max(1, abs(raw_delta) // 120) if raw_delta else 1
+        delta = -steps if raw_delta > 0 else steps
+        self.tree.xview_scroll(delta, "units")
+        return "break"
+
+    def _node_depth(self, node_id: str) -> int:
+        depth = -1
+        current = node_id
+        while current:
+            depth += 1
+            current = self.tree.parent(current)
+        return max(depth, 0)
+
+    def _reset_tree_width(self, root_text: str) -> None:
+        root_width = self._tree_text_font.measure(root_text) + 40
+        self._tree_content_width = max(320, root_width)
+        self.tree.column("#0", width=self._tree_content_width)
+
+    def _grow_tree_width(self, text: str, depth: int) -> None:
+        required = self._tree_text_font.measure(text) + 44 + (depth * 22)
+        if required > self._tree_content_width:
+            self._tree_content_width = required
+            self.tree.column("#0", width=self._tree_content_width)
 
     def _selected_path(self) -> str | None:
         selected = self.tree.selection()

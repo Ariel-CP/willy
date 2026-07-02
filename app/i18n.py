@@ -57,6 +57,33 @@ _STRINGS = {
         "settings_theme": "Tema:",
         "settings_language": "Idioma:",
         "settings_confirm_readonly": "Confirmar comandos de lectura:",
+        "settings_security_profile": "Perfil de seguridad:",
+        "security_profile_lab_safe": "Laboratorio seguro (recomendado)",
+        "security_profile_standard": "Estándar",
+        "security_profile_permissive": "Permisivo",
+        "settings_security_hint": (
+            "Laboratorio seguro: solo comandos permitidos y bloqueo de patrones peligrosos.\n"
+            "Estándar: permite más comandos, manteniendo bloqueo de alto riesgo.\n"
+            "Permisivo: sin restricciones de perfil (solo para entornos controlados)."
+        ),
+        "settings_operation_role": "Rol operativo:",
+        "operation_role_student": "Alumno",
+        "operation_role_instructor": "Docente",
+        "operation_role_admin": "Administrador",
+        "settings_operation_role_hint": (
+            "Alumno: restringe herramientas sensibles (no ejecuta comandos arbitrarios ni escritura de archivos).\n"
+            "Docente: flujo completo de laboratorio y operaciones IoT guiadas.\n"
+            "Administrador: acceso total para mantenimiento y soporte avanzado."
+        ),
+        "settings_audit_export": "Exportación de auditoría:",
+        "settings_audit_hint": (
+            "Genera reportes JSON sin secretos desde las sesiones locales para seguimiento de prácticas."
+        ),
+        "export_audit_7d_btn": "Exportar últimos 7 días",
+        "export_audit_session_btn": "Exportar sesión actual",
+        "audit_export_ok": "Auditoría exportada: {path}",
+        "audit_export_error": "No se pudo exportar auditoría: {error}",
+        "settings_locked_notice": "Política de estación activa: los siguientes ajustes están bloqueados: {keys}",
         "settings_cancel": "Cancelar",
         "settings_save": "Guardar",
         "save_btn": "Guardar",
@@ -117,6 +144,33 @@ _STRINGS = {
         "settings_theme": "Theme:",
         "settings_language": "Language:",
         "settings_confirm_readonly": "Confirm read-only cmds:",
+        "settings_security_profile": "Security profile:",
+        "security_profile_lab_safe": "Lab safe (recommended)",
+        "security_profile_standard": "Standard",
+        "security_profile_permissive": "Permissive",
+        "settings_security_hint": (
+            "Lab safe: allowlisted commands plus dangerous-pattern blocking.\n"
+            "Standard: broader commands while keeping high-risk block rules.\n"
+            "Permissive: profile restrictions disabled (controlled environments only)."
+        ),
+        "settings_operation_role": "Operation role:",
+        "operation_role_student": "Student",
+        "operation_role_instructor": "Instructor",
+        "operation_role_admin": "Administrator",
+        "settings_operation_role_hint": (
+            "Student: restricts sensitive tools (no arbitrary command execution or file writes).\n"
+            "Instructor: full lab workflow and guided IoT operations.\n"
+            "Administrator: full access for maintenance and advanced support."
+        ),
+        "settings_audit_export": "Audit export:",
+        "settings_audit_hint": (
+            "Generate redacted JSON reports from local sessions for lab traceability."
+        ),
+        "export_audit_7d_btn": "Export last 7 days",
+        "export_audit_session_btn": "Export current session",
+        "audit_export_ok": "Audit exported: {path}",
+        "audit_export_error": "Audit export failed: {error}",
+        "settings_locked_notice": "Station policy active: the following settings are locked: {keys}",
         "settings_cancel": "Cancel",
         "settings_save": "Save",
         "save_btn": "Save",

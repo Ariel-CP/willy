@@ -1,26 +1,42 @@
 #include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
-#include <TM1637Display.h>
+// LCD 20x4 con backpack PCF8574T (direccion tipica 0x27)
+LiquidCrystal_I2C lcd(0x27, 20, 4);
 
-// Definir los pines CLK y DIO para el TM1637
-#define CLK 2
-#define DIO 3
-
-TM1637Display display(CLK, DIO);
+int counterValue = 0;
+unsigned long lastTickMs = 0;
+const unsigned long intervalMs = 350;
 
 void setup() {
-  display.setBrightness(6); // ~80% en rango 0-7 de la libreria TM1637
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Contador 0-100");
+  lcd.setCursor(0, 1);
+  lcd.print("Iniciando...");
+  delay(1200);
+  lcd.clear();
 }
 
 void loop() {
-  for (int i = 0; i <= 100; i++) {
-    display.showNumberDec(i, false); // Mostrar el número en decimal
-    delay(1000);
+  unsigned long now = millis();
+  if (now - lastTickMs >= intervalMs) {
+    lastTickMs = now;
+
+    lcd.setCursor(0, 0);
+    lcd.print("Cuenta:            ");
+    lcd.setCursor(8, 0);
+    lcd.print(counterValue);
+
+    lcd.setCursor(0, 1);
+    lcd.print("LCD 20x4 I2C OK    ");
+
+    counterValue++;
+    if (counterValue > 100) {
+      counterValue = 0;
+    }
   }
-  delay(2000); // Esperar antes de comenzar la cuenta regresiva
-  for (int i = 100; i >= 0; i--) {
-    display.showNumberDec(i, false);
-    delay(1000);
-  }
-  delay(2000); // Esperar antes de comenzar el siguiente ciclo
 }

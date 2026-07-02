@@ -11,7 +11,7 @@ import queue
 import threading
 import traceback
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 import tkinter as tk
 import customtkinter as ctk
 from PIL import Image, ImageTk
@@ -33,6 +33,15 @@ from app import i18n
 
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
+STATION_POLICY_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "station_policy.json",
+)
+AUDIT_OUTPUT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "outputs",
+    "audit",
+)
 
 
 def _is_configured_api_key(value: str) -> bool:
@@ -57,15 +66,43 @@ def _load_config() -> dict:
         raise RuntimeError(f"Invalid config.json: {exc}") from exc
 
 
+def _load_station_policy() -> dict:
+    try:
+        with open(STATION_POLICY_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _apply_station_policy(config: dict, station_policy: dict) -> tuple[dict, set[str]]:
+    merged = dict(config or {})
+    enforced = station_policy.get("enforced", {})
+    locked_keys: set[str] = set()
+
+    if isinstance(enforced, dict):
+        for key, value in enforced.items():
+            merged[key] = value
+            locked_keys.add(str(key))
+
+    return merged, locked_keys
+
+
 class WillyApp(ctk.CTk):
     def __init__(self):
         config = _load_config()
+        station_policy = _load_station_policy()
+        config, locked_keys = _apply_station_policy(config, station_policy)
         i18n.set_language(config.get("language", "es"))
         ctk.set_appearance_mode(config.get("theme", "dark"))
         ctk.set_default_color_theme("blue")
         super().__init__()
 
         self.config_data = config
+        self._station_policy = station_policy
+        self._locked_config_keys = locked_keys
         self.title(i18n.get("app_title"))
         self.geometry("1280x760")
         self.minsize(900, 600)
@@ -81,6 +118,7 @@ class WillyApp(ctk.CTk):
         self._schematic_preview_photo = None
         self.serial_window = None
         self.serial_output_text = None
+        self.serial_popup_output_text = None
         self.serial_terminal_manager = None
         self.serial_status_var = tk.StringVar(value="Monitor serial inactivo")
         self.serial_timestamps_var = tk.BooleanVar(value=True)
@@ -88,6 +126,12 @@ class WillyApp(ctk.CTk):
         self.serial_paused_buffer: list[str] = []
         self.serial_paused_buffer_max = 5000
         self._current_code_path = ""
+        self._active_project_path = ""
+        self._active_project_info: dict = {}
+        self._active_netlist_path = ""
+        self._project_poll_job = None
+        self._last_iot_action_state = "idle"
+        self._updating_project = False
         self._code_expand_window = None
         self._code_expand_text = None
         self._iot_action_running = False
@@ -96,6 +140,8 @@ class WillyApp(ctk.CTk):
         self._wire_up()
         self.after(50, self._process_tts_visual_events)
         self.after(200, self._show_startup_greeting)
+        self.after(500, self._update_active_project_if_changed)
+        self.after(700, self._schedule_next_project_poll)
         self.after(800, self._trigger_device_scan)
         self.after(1200, self._refresh_latest_schematic)
 
@@ -117,7 +163,12 @@ class WillyApp(ctk.CTk):
         self.session_logger.log_event(
             "app_start",
             component="gui",
-            data={"cwd": os.getcwd(), "config_path": CONFIG_PATH},
+            data={
+                "cwd": os.getcwd(),
+                "config_path": CONFIG_PATH,
+                "station_policy_path": STATION_POLICY_PATH,
+                "locked_keys": sorted(self._locked_config_keys),
+            },
         )
         self.terminal_manager = TerminalManager(
             output_callback=self._on_terminal_output,
@@ -139,6 +190,7 @@ class WillyApp(ctk.CTk):
         self.file_browser = FileBrowser(
             self,
             on_file_selected=self._on_file_selected,
+            initial_path=initial_dir,
             width=200,
             fg_color=("gray90", "gray12"),
         )
@@ -155,36 +207,16 @@ class WillyApp(ctk.CTk):
         self.right_panel.grid_columnconfigure(0, weight=1)
         self.right_panel.grid_rowconfigure(0, weight=1)
 
-        self.right_splitter = tk.PanedWindow(
+        self.right_tabview = ctk.CTkTabview(
             self.right_panel,
-            orient=tk.VERTICAL,
-            sashwidth=8,
-            bd=0,
-            relief="flat",
-            bg="#0a0f14",
-        )
-        self.right_splitter.grid(row=0, column=0, sticky="nsew")
-
-        self.dashboard_container = ctk.CTkFrame(self.right_panel, fg_color=("gray92", "#0a0f14"))
-        self.terminal_container = ctk.CTkFrame(self.right_panel, fg_color=("gray92", "#0a0f14"))
-        self.dashboard_container.grid_rowconfigure(0, weight=1)
-        self.dashboard_container.grid_columnconfigure(0, weight=1)
-        self.terminal_container.grid_rowconfigure(0, weight=1)
-        self.terminal_container.grid_columnconfigure(0, weight=1)
-
-        self.right_splitter.add(self.dashboard_container, minsize=260)
-        self.right_splitter.add(self.terminal_container, minsize=150)
-
-        self._build_iot_dashboard(self.dashboard_container)
-
-        self.terminal_panel = TerminalPanel(
-            self.terminal_container,
-            terminal_manager=self.terminal_manager,
             fg_color=("gray92", "#0a0f14"),
+            segmented_button_fg_color=("gray80", "gray26"),
+            segmented_button_selected_color="#2563eb",
+            segmented_button_selected_hover_color="#1d4ed8",
         )
-        self.terminal_panel.grid(row=0, column=0, sticky="nsew")
+        self.right_tabview.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
-        self.after(150, lambda: self.right_splitter.sash_place(0, 1, 360))
+        self._build_workspace_tabs(self.right_tabview)
 
         status_bar = ctk.CTkFrame(self, height=22, fg_color=("gray80", "gray18"))
         status_bar.grid(row=1, column=0, columnspan=3, sticky="ew")
@@ -234,13 +266,27 @@ class WillyApp(ctk.CTk):
             command=self._open_settings,
         ).grid(row=0, column=3, padx=(0, 4))
 
-    def _build_iot_dashboard(self, parent) -> None:
-        dashboard = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
-        dashboard.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        dashboard.grid_columnconfigure(0, weight=1)
-        dashboard.grid_rowconfigure(8, weight=1)
+    def _build_workspace_tabs(self, tabview) -> None:
+        terminal_tab = tabview.add("Terminal + Consola")
+        flow_tab = tabview.add("Flujo del Sistema")
+        wiring_tab = tabview.add("Conexion Electrica")
+        code_tab = tabview.add("Codigo del Programa")
 
-        top_row = ctk.CTkFrame(dashboard, fg_color="transparent")
+        self._build_terminal_console_tab(terminal_tab)
+        self._build_flow_tab(flow_tab)
+        self._build_wiring_tab(wiring_tab)
+        self._build_code_tab(code_tab)
+        tabview.set("Terminal + Consola")
+
+    def _build_terminal_console_tab(self, parent) -> None:
+        parent.grid_rowconfigure(2, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        device_card = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
+        device_card.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 4))
+        device_card.grid_columnconfigure(0, weight=1)
+
+        top_row = ctk.CTkFrame(device_card, fg_color="transparent")
         top_row.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 4))
         top_row.grid_columnconfigure(1, weight=1)
 
@@ -263,7 +309,7 @@ class WillyApp(ctk.CTk):
         )
         self.scan_btn.grid(row=0, column=2, sticky="e")
 
-        status_row = ctk.CTkFrame(dashboard, fg_color="transparent")
+        status_row = ctk.CTkFrame(device_card, fg_color="transparent")
         status_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
         status_row.grid_columnconfigure(1, weight=1)
 
@@ -296,8 +342,8 @@ class WillyApp(ctk.CTk):
         )
         self.device_detail_label.grid(row=1, column=1, sticky="w")
 
-        device_row = ctk.CTkFrame(dashboard, fg_color="transparent")
-        device_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 4))
+        device_row = ctk.CTkFrame(device_card, fg_color="transparent")
+        device_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 6))
         device_row.grid_columnconfigure(0, weight=1)
 
         self.device_picker_var = tk.StringVar(value="Sin dispositivos")
@@ -322,8 +368,12 @@ class WillyApp(ctk.CTk):
         )
         self.connect_btn.grid(row=0, column=1, sticky="e")
 
-        monitor_row = ctk.CTkFrame(dashboard, fg_color="transparent")
-        monitor_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 4))
+        serial_card = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
+        serial_card.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
+        serial_card.grid_columnconfigure(0, weight=1)
+
+        monitor_row = ctk.CTkFrame(serial_card, fg_color="transparent")
+        monitor_row.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 6))
         monitor_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
@@ -380,12 +430,38 @@ class WillyApp(ctk.CTk):
 
         self.serial_hint_label = ctk.CTkLabel(
             monitor_row,
-            text="Salida en ventana dedicada del monitor serial",
+            text="Consola serial integrada en esta solapa (Abrir = vista flotante opcional)",
             font=ctk.CTkFont(size=9),
             text_color=("gray45", "gray65"),
             anchor="w",
         )
-        self.serial_hint_label.grid(row=1, column=0, columnspan=5, sticky="w", pady=(2, 0))
+        self.serial_hint_label.grid(row=1, column=0, columnspan=5, sticky="w", pady=(2, 2))
+
+        serial_output_frame = ctk.CTkFrame(monitor_row, fg_color=("gray96", "#0d1117"))
+        serial_output_frame.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(0, 2))
+        serial_output_frame.grid_columnconfigure(0, weight=1)
+        serial_output_frame.grid_rowconfigure(0, weight=1)
+
+        self.serial_output_text = tk.Text(
+            serial_output_frame,
+            wrap="word",
+            state="disabled",
+            font=("monospace", 10),
+            bg="#0d1117",
+            fg="#d0d0d0",
+            insertbackground="white",
+            selectbackground="#264f78",
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=6,
+            height=7,
+        )
+        self.serial_output_text.grid(row=0, column=0, sticky="ew")
+
+        serial_scroll = ctk.CTkScrollbar(serial_output_frame, command=self.serial_output_text.yview)
+        serial_scroll.grid(row=0, column=1, sticky="ns")
+        self.serial_output_text.configure(yscrollcommand=serial_scroll.set)
 
         self.serial_state_label = ctk.CTkLabel(
             monitor_row,
@@ -394,10 +470,80 @@ class WillyApp(ctk.CTk):
             text_color=("gray45", "#7ec8e3"),
             anchor="w",
         )
-        self.serial_state_label.grid(row=2, column=0, columnspan=5, sticky="w", pady=(1, 0))
+        self.serial_state_label.grid(row=3, column=0, columnspan=5, sticky="w", pady=(1, 0))
 
-        diagram_row = ctk.CTkFrame(dashboard, fg_color="transparent")
-        diagram_row.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 4))
+        terminal_card = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
+        terminal_card.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        terminal_card.grid_rowconfigure(0, weight=1)
+        terminal_card.grid_columnconfigure(0, weight=1)
+
+        self.terminal_panel = TerminalPanel(
+            terminal_card,
+            terminal_manager=self.terminal_manager,
+            fg_color=("gray92", "#0a0f14"),
+        )
+        self.terminal_panel.grid(row=0, column=0, sticky="nsew")
+
+    def _build_flow_tab(self, parent) -> None:
+        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
+        header.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 4))
+        header.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            header,
+            text="Diagrama de Flujo del Sistema",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("gray20", "#7ec8e3"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=6)
+
+        ctk.CTkButton(
+            header,
+            text="Actualizar",
+            width=90,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=self._refresh_flow_diagram_text,
+        ).grid(row=0, column=1, sticky="e", padx=(0, 8), pady=6)
+
+        flow_frame = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
+        flow_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        flow_frame.grid_rowconfigure(0, weight=1)
+        flow_frame.grid_columnconfigure(0, weight=1)
+
+        self.flow_canvas = tk.Canvas(
+            flow_frame,
+            bg="#0d1117",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.flow_canvas.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.flow_canvas.bind("<Configure>", lambda _e: self._refresh_flow_diagram_text())
+        self._refresh_flow_diagram_text()
+
+    def _build_wiring_tab(self, parent) -> None:
+        parent.grid_rowconfigure(2, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        top = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
+        top.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 4))
+        top.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            top,
+            text="Diagrama de Conexion Electrica",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("gray20", "#7ec8e3"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=6)
+
+        diagram_row = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
+        diagram_row.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
         diagram_row.grid_columnconfigure(0, weight=1)
 
         self.diagram_status_label = ctk.CTkLabel(
@@ -408,7 +554,7 @@ class WillyApp(ctk.CTk):
             anchor="w",
             justify="left",
         )
-        self.diagram_status_label.grid(row=0, column=0, sticky="w")
+        self.diagram_status_label.grid(row=0, column=0, sticky="w", padx=8, pady=6)
 
         self.diagram_refresh_btn = ctk.CTkButton(
             diagram_row,
@@ -420,7 +566,7 @@ class WillyApp(ctk.CTk):
             hover_color=("gray60", "gray45"),
             command=self._refresh_latest_schematic,
         )
-        self.diagram_refresh_btn.grid(row=0, column=1, sticky="e", padx=(6, 4))
+        self.diagram_refresh_btn.grid(row=0, column=1, sticky="e", padx=(6, 4), pady=6)
 
         self.diagram_open_btn = ctk.CTkButton(
             diagram_row,
@@ -433,37 +579,72 @@ class WillyApp(ctk.CTk):
             command=self._open_latest_schematic,
             state="disabled",
         )
-        self.diagram_open_btn.grid(row=0, column=2, sticky="e")
+        self.diagram_open_btn.grid(row=0, column=2, sticky="e", padx=(0, 8), pady=6)
+
+        preview_card = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
+        preview_card.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        preview_card.grid_rowconfigure(1, weight=1)
+        preview_card.grid_rowconfigure(3, weight=1)
+        preview_card.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            dashboard,
+            preview_card,
             text="Preview del esquema",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=("gray30", "gray80"),
             anchor="w",
-        ).grid(row=5, column=0, sticky="w", padx=8, pady=(4, 2))
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 2))
 
         self.diagram_preview = tk.Label(
-            dashboard,
+            preview_card,
             text="Sin preview disponible",
             bg="#0d1117",
             fg="#9ca3af",
             anchor="center",
             justify="center",
-            height=6,
+            height=8,
         )
-        self.diagram_preview.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 6))
+        self.diagram_preview.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
 
         ctk.CTkLabel(
-            dashboard,
-            text="Codigo en desarrollo",
+            preview_card,
+            text="Conexiones detectadas (netlist/BOM)",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=("gray30", "gray80"),
             anchor="w",
-        ).grid(row=7, column=0, sticky="w", padx=8, pady=(2, 2))
+        ).grid(row=2, column=0, sticky="w", padx=8, pady=(0, 2))
 
-        code_actions = ctk.CTkFrame(dashboard, fg_color="transparent")
-        code_actions.grid(row=7, column=0, sticky="e", padx=8, pady=(2, 2))
+        self.wiring_summary_text = ctk.CTkTextbox(
+            preview_card,
+            height=120,
+            font=ctk.CTkFont(family="monospace", size=10),
+            fg_color=("gray96", "#0d1117"),
+            border_color=("gray70", "gray40"),
+            border_width=1,
+            wrap="word",
+        )
+        self.wiring_summary_text.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self.wiring_summary_text.insert("0.0", "Esperando netlist/BOM del proyecto activo...")
+        self.wiring_summary_text.configure(state="disabled")
+
+    def _build_code_tab(self, parent) -> None:
+        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        code_header = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
+        code_header.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 4))
+        code_header.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            code_header,
+            text="Codigo del Programa",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("gray20", "#7ec8e3"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=6)
+
+        code_actions = ctk.CTkFrame(code_header, fg_color="transparent")
+        code_actions.grid(row=0, column=1, sticky="e", padx=(0, 8), pady=6)
 
         self.code_action_indicator = tk.Canvas(
             code_actions,
@@ -511,8 +692,13 @@ class WillyApp(ctk.CTk):
         )
         self.expand_code_btn.pack(side="left")
 
+        code_card = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
+        code_card.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        code_card.grid_rowconfigure(0, weight=1)
+        code_card.grid_columnconfigure(0, weight=1)
+
         self.code_preview = ctk.CTkTextbox(
-            dashboard,
+            code_card,
             height=140,
             font=ctk.CTkFont(family="monospace", size=11),
             fg_color=("gray96", "#0d1117"),
@@ -520,12 +706,205 @@ class WillyApp(ctk.CTk):
             border_width=1,
             wrap="word",
         )
-        self.code_preview.grid(row=8, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self.code_preview.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         self.code_preview.insert("0.0", "Selecciona un archivo para ver el codigo en desarrollo...")
         self.code_preview.configure(state="disabled")
 
-        self._set_device_indicator(False)
         self._set_code_action_indicator("idle")
+        self._set_device_indicator(False)
+
+    def _refresh_flow_diagram_text(self) -> None:
+        if not hasattr(self, "flow_canvas") or self.flow_canvas is None:
+            return
+
+        try:
+            cwd = self.terminal_manager.get_cwd()
+        except Exception:
+            cwd = os.getcwd()
+
+        os_name = platform.system() or "Unknown"
+        model = self.config_data.get("model", "gpt-5.3-codex")
+        board = self.config_data.get("default_board", "uno")
+        port = self.config_data.get("default_port", "COM?")
+        detected = len(self._detected_devices) if isinstance(self._detected_devices, list) else 0
+        project_name = os.path.basename(self._active_project_path) if self._active_project_path else "sin proyecto"
+        main_code = os.path.join(self._active_project_path, "src", "main.cpp") if self._active_project_path else ""
+        has_code = bool(main_code and os.path.isfile(main_code))
+        has_diagram = bool(self._latest_schematic_path and os.path.isfile(self._latest_schematic_path))
+        has_netlist = bool(self._active_netlist_path and os.path.isfile(self._active_netlist_path))
+        envs = self._active_project_info.get("environments", []) if isinstance(self._active_project_info, dict) else []
+        env_label = ", ".join([str(e) for e in envs[:2]]) if envs else "(sin env)"
+
+        canvas = self.flow_canvas
+        canvas.delete("all")
+
+        width = max(760, canvas.winfo_width())
+        height = max(520, canvas.winfo_height())
+
+        title_color = "#7ec8e3"
+        text_color = "#d1d5db"
+        edge_color = "#60a5fa"
+
+        canvas.create_text(
+            14,
+            16,
+            anchor="w",
+            fill=title_color,
+            font=("Segoe UI", 12, "bold"),
+            text="Flujo General del Sistema",
+        )
+        canvas.create_text(
+            14,
+            38,
+            anchor="w",
+            fill="#9ca3af",
+            font=("Segoe UI", 9),
+            text=(
+                f"OS: {os_name} | Modelo: {model} | board: {board} | port: {port} | detectados: {detected} "
+                f"| proyecto: {project_name}"
+            ),
+        )
+        canvas.create_text(
+            14,
+            56,
+            anchor="w",
+            fill="#6b7280",
+            font=("Segoe UI", 8),
+            text=f"CWD: {cwd} | env: {env_label}",
+        )
+
+        node_w = 190
+        node_h = 54
+        cx = int(width * 0.30)
+        rx = int(width * 0.70)
+        y0 = 90
+        gap = 86
+
+        user_box = (cx, y0)
+        chat_box = (cx, y0 + gap)
+        agent_box = (cx, y0 + (gap * 2))
+        logger_box = (cx, y0 + (gap * 3))
+
+        tm_box = (rx, y0 + gap)
+        arduino_box = (rx, y0 + (gap * 2))
+        diag_box = (rx, y0 + (gap * 3))
+
+        self._draw_flow_node(*user_box, node_w, node_h, "Usuario", "Solicita acciones", "#1f2937")
+        self._draw_flow_node(*chat_box, node_w, node_h, "ChatPanel / UI", "Mensajes y estado", "#1e3a5f")
+        self._draw_flow_node(*agent_box, node_w, node_h, "AIAgent", "Planifica y llama tools", "#0f766e")
+        self._draw_flow_node(*logger_box, node_w, node_h, "SessionLogger", "Auditoria y sesiones", "#3f3f46")
+
+        self._draw_flow_node(*tm_box, node_w, node_h, "TerminalManager", "Comandos del sistema", "#1d4ed8")
+        state_colors = {
+            "idle": "#166534",
+            "compiling": "#1d4ed8",
+            "uploading": "#d97706",
+            "success": "#15803d",
+            "error": "#991b1b",
+        }
+        run_color = state_colors.get(self._last_iot_action_state, state_colors["idle"])
+        self._draw_flow_node(
+            *arduino_box,
+            node_w,
+            node_h,
+            "ArduinoManager",
+            f"Build / Upload / I2C ({self._last_iot_action_state})",
+            run_color,
+        )
+        self._draw_flow_node(
+            *diag_box,
+            node_w,
+            node_h,
+            "IoTDiagramManager",
+            f"Esquema={'si' if has_diagram else 'no'} | Netlist={'si' if has_netlist else 'no'}",
+            "#7c2d12",
+        )
+
+        self._draw_flow_arrow(cx, y0 + node_h, cx, y0 + gap)
+        self._draw_flow_arrow(cx, y0 + gap + node_h, cx, y0 + (gap * 2))
+        self._draw_flow_arrow(cx, y0 + (gap * 2) + node_h, cx, y0 + (gap * 3))
+
+        self._draw_flow_arrow(cx + node_w, y0 + (gap * 2) + int(node_h / 2), rx, y0 + gap + int(node_h / 2))
+        self._draw_flow_arrow(cx + node_w, y0 + (gap * 2) + int(node_h / 2), rx, y0 + (gap * 2) + int(node_h / 2))
+        self._draw_flow_arrow(cx + node_w, y0 + (gap * 2) + int(node_h / 2), rx, y0 + (gap * 3) + int(node_h / 2))
+
+        card_x1 = 14
+        card_y1 = height - 130
+        card_x2 = width - 14
+        card_y2 = height - 14
+        canvas.create_rectangle(card_x1, card_y1, card_x2, card_y2, outline="#334155", fill="#0b1220", width=1)
+        canvas.create_text(
+            card_x1 + 10,
+            card_y1 + 12,
+            anchor="w",
+            fill=title_color,
+            font=("Segoe UI", 10, "bold"),
+            text="Flujo IoT de Campo",
+        )
+        steps = "1) Escanear dispositivo   2) Conectar   3) Compilar   4) Grabar   5) Monitor serial   6) I2C scan"
+        canvas.create_text(
+            card_x1 + 10,
+            card_y1 + 36,
+            anchor="w",
+            fill=text_color,
+            font=("Segoe UI", 9),
+            text=steps,
+        )
+        status_label = "Conectado" if detected > 0 else "Sin dispositivos detectados"
+        status_color = "#22c55e" if detected > 0 else edge_color
+        canvas.create_text(
+            card_x1 + 10,
+            card_y1 + 58,
+            anchor="w",
+            fill=status_color,
+            font=("Segoe UI", 9, "bold"),
+            text=f"Estado actual: {status_label}",
+        )
+        code_label = os.path.basename(main_code) if has_code else "sin src/main.cpp"
+        canvas.create_text(
+            card_x1 + 10,
+            card_y1 + 78,
+            anchor="w",
+            fill="#93c5fd",
+            font=("Segoe UI", 9),
+            text=f"Codigo activo: {code_label}",
+        )
+
+    def _draw_flow_node(self, x: int, y: int, w: int, h: int, title: str, subtitle: str, fill: str) -> None:
+        if not hasattr(self, "flow_canvas") or self.flow_canvas is None:
+            return
+        canvas = self.flow_canvas
+        canvas.create_rectangle(x, y, x + w, y + h, outline="#475569", fill=fill, width=1)
+        canvas.create_text(
+            x + 10,
+            y + 16,
+            anchor="w",
+            fill="#f8fafc",
+            font=("Segoe UI", 10, "bold"),
+            text=title,
+        )
+        canvas.create_text(
+            x + 10,
+            y + 36,
+            anchor="w",
+            fill="#cbd5e1",
+            font=("Segoe UI", 9),
+            text=subtitle,
+        )
+
+    def _draw_flow_arrow(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        if not hasattr(self, "flow_canvas") or self.flow_canvas is None:
+            return
+        self.flow_canvas.create_line(
+            x1,
+            y1,
+            x2,
+            y2,
+            fill="#60a5fa",
+            width=2,
+            arrow=tk.LAST,
+            smooth=True,
+        )
 
     # ------------------------------------------------------------------
     # Wiring
@@ -735,6 +1114,8 @@ class WillyApp(ctk.CTk):
         self._current_code_path = path
         self.chat_panel.add_message("system", i18n.get("file_selected", path=path))
         self._update_code_preview(path)
+        self._update_active_project_if_changed()
+        self._refresh_flow_diagram_text()
         self.ai_agent.send(i18n.get("file_send_msg", path=path))
 
     def _on_schematic_generated(self, svg_path: str, bom_path: str) -> None:
@@ -744,6 +1125,11 @@ class WillyApp(ctk.CTk):
     def _apply_generated_schematic(self, svg_path: str, bom_path: str) -> None:
         self._latest_schematic_path = svg_path or ""
         self._latest_bom_path = bom_path or ""
+        if svg_path:
+            base = os.path.splitext(svg_path)[0]
+            net_candidate = base + ".net"
+            if os.path.isfile(net_candidate):
+                self._active_netlist_path = net_candidate
 
         if hasattr(self, "diagram_status_label"):
             if svg_path and os.path.isfile(svg_path):
@@ -754,10 +1140,13 @@ class WillyApp(ctk.CTk):
                 self.diagram_open_btn.configure(state="disabled")
 
         self._update_schematic_preview(svg_path)
+        self._update_wiring_summary()
+        self._refresh_flow_diagram_text()
 
     def _on_ai_file_written(self, path: str, content: str) -> None:
         # Called from agent worker thread; marshal to UI thread.
         self.after(0, self._update_code_preview_from_content, path, content)
+        self.after(0, self._update_active_project_if_changed)
 
     def _update_code_preview_from_content(self, path: str, content: str) -> None:
         self._current_code_path = path
@@ -798,7 +1187,107 @@ class WillyApp(ctk.CTk):
         self.code_action_indicator.delete("all")
         self.code_action_indicator.create_oval(3, 3, 13, 13, fill=color, outline=color)
 
+    def _detect_active_project(self) -> str:
+        candidates: list[str] = []
+        if self._current_code_path:
+            candidates.append(os.path.abspath(self._current_code_path))
+
+        try:
+            cwd = self.terminal_manager.get_cwd()
+        except Exception:
+            cwd = os.getcwd()
+
+        candidates.append(os.path.join(cwd, "src", "main.cpp"))
+        candidates.append(cwd)
+
+        for file_candidate in candidates:
+            base = file_candidate if os.path.isdir(file_candidate) else os.path.dirname(file_candidate)
+            cur = os.path.abspath(base)
+            while True:
+                if os.path.exists(os.path.join(cur, "platformio.ini")):
+                    return cur
+                parent = os.path.dirname(cur)
+                if parent == cur:
+                    break
+                cur = parent
+        return ""
+
+    def _update_active_project_if_changed(self) -> bool:
+        if self._updating_project:
+            return False
+
+        self._updating_project = True
+        try:
+            project_path = self._detect_active_project()
+            if project_path == self._active_project_path:
+                return False
+
+            info: dict = {}
+            if project_path:
+                try:
+                    info = self.arduino_manager.get_project_info(project_path)
+                except Exception:
+                    info = {}
+
+            self._on_project_changed(project_path, info)
+            return True
+        finally:
+            self._updating_project = False
+
+    def _on_project_changed(self, project_path: str, project_info: dict) -> None:
+        self._active_project_path = project_path or ""
+        self._active_project_info = project_info or {}
+
+        if self._active_project_path:
+            self._load_code_for_project(self._active_project_path)
+
+        self._refresh_latest_schematic()
+        self._refresh_flow_diagram_text()
+
+        self.session_logger.log_event(
+            "project_activated",
+            component="gui",
+            data={
+                "project_path": self._active_project_path,
+                "environments": self._active_project_info.get("environments", []),
+                "default_env": self._active_project_info.get("default_env", ""),
+            },
+        )
+
+    def _load_code_for_project(self, project_path: str) -> None:
+        main_cpp = os.path.join(project_path, "src", "main.cpp")
+        if os.path.isfile(main_cpp):
+            self._update_code_preview(main_cpp)
+            return
+
+        preview = (
+            f"Proyecto activo: {project_path}\n\n"
+            "No se encontró src/main.cpp en este proyecto.\n"
+            "Selecciona un archivo desde el explorador para ver su contenido."
+        )
+        if hasattr(self, "code_preview"):
+            self.code_preview.configure(state="normal")
+            self.code_preview.delete("0.0", "end")
+            self.code_preview.insert("0.0", preview)
+            self.code_preview.configure(state="disabled")
+
+    def _schedule_next_project_poll(self) -> None:
+        if self._project_poll_job is not None:
+            try:
+                self.after_cancel(self._project_poll_job)
+            except Exception:
+                pass
+
+        def _tick() -> None:
+            self._update_active_project_if_changed()
+            self._schedule_next_project_poll()
+
+        self._project_poll_job = self.after(2500, _tick)
+
     def _resolve_project_path_for_actions(self) -> str:
+        if self._active_project_path and os.path.isfile(os.path.join(self._active_project_path, "platformio.ini")):
+            return self._active_project_path
+
         candidates: list[str] = []
         if self._current_code_path:
             candidates.append(os.path.abspath(self._current_code_path))
@@ -866,8 +1355,10 @@ class WillyApp(ctk.CTk):
         if self._iot_action_running:
             return
         self._iot_action_running = True
+        self._last_iot_action_state = "compiling"
         self._set_iot_action_buttons_state(False)
         self._set_code_action_indicator("compiling")
+        self._refresh_flow_diagram_text()
         threading.Thread(target=self._compile_worker, daemon=True).start()
 
     def _compile_worker(self) -> None:
@@ -880,6 +1371,7 @@ class WillyApp(ctk.CTk):
         self._iot_action_running = False
         self._set_iot_action_buttons_state(True)
         ok = bool(result.get("ok"))
+        self._last_iot_action_state = "success" if ok else "error"
         self._set_code_action_indicator("success" if ok else "error")
         if ok:
             self._on_status(f"Compilacion OK ({env or 'default'})")
@@ -887,14 +1379,18 @@ class WillyApp(ctk.CTk):
         else:
             err = result.get("error", "Error desconocido")
             self.chat_panel.add_message("error", f"Fallo compilacion: {err}")
+        self._update_active_project_if_changed()
+        self._refresh_flow_diagram_text()
         self.after(2200, lambda: self._set_code_action_indicator("idle"))
 
     def _start_upload(self) -> None:
         if self._iot_action_running:
             return
         self._iot_action_running = True
+        self._last_iot_action_state = "uploading"
         self._set_iot_action_buttons_state(False)
         self._set_code_action_indicator("uploading")
+        self._refresh_flow_diagram_text()
         threading.Thread(target=self._upload_worker, daemon=True).start()
 
     def _upload_worker(self) -> None:
@@ -908,6 +1404,7 @@ class WillyApp(ctk.CTk):
         self._iot_action_running = False
         self._set_iot_action_buttons_state(True)
         ok = bool(result.get("ok"))
+        self._last_iot_action_state = "success" if ok else "error"
         self._set_code_action_indicator("success" if ok else "error")
         if ok:
             self._on_status(f"Grabacion OK en {port} ({env or 'default'})")
@@ -915,6 +1412,8 @@ class WillyApp(ctk.CTk):
         else:
             err = result.get("error", "Error desconocido")
             self.chat_panel.add_message("error", f"Fallo grabacion: {err}")
+        self._update_active_project_if_changed()
+        self._refresh_flow_diagram_text()
         self.after(2200, lambda: self._set_code_action_indicator("idle"))
 
     def _open_expanded_code_view(self) -> None:
@@ -1060,6 +1559,7 @@ class WillyApp(ctk.CTk):
         self.device_status_label.configure(text=f"Conectado: {board} en {port}")
         self.device_detail_label.configure(text="Puerto y placa por defecto actualizados")
         self._on_status(f"IoT activo: {board} en {port}")
+        self._refresh_flow_diagram_text()
 
     def _selected_or_default_port(self) -> str:
         selected = self.device_picker_var.get() if hasattr(self, "device_picker_var") else ""
@@ -1071,8 +1571,6 @@ class WillyApp(ctk.CTk):
         return self.config_data.get("default_port", "/dev/ttyUSB0")
 
     def _start_serial_monitor(self) -> None:
-        self._open_serial_monitor_window()
-
         port = self._selected_or_default_port()
         baud_raw = self.serial_baud_var.get().strip() if hasattr(self, "serial_baud_var") else "115200"
         try:
@@ -1135,13 +1633,14 @@ class WillyApp(ctk.CTk):
         win = ctk.CTkToplevel(self)
         win.title("Consola Serial")
         win.geometry("760x420")
-        win.minsize(520, 300)
+        win.minsize(700, 380)
         win.grid_rowconfigure(1, weight=1)
         win.grid_columnconfigure(0, weight=1)
 
         header = ctk.CTkFrame(win, fg_color=("gray85", "gray20"))
         header.grid(row=0, column=0, sticky="ew")
         header.grid_columnconfigure(1, weight=1)
+        header.grid_columnconfigure(2, weight=0)
 
         ctk.CTkLabel(
             header,
@@ -1157,32 +1656,35 @@ class WillyApp(ctk.CTk):
             anchor="w",
         ).grid(row=0, column=1, padx=4, pady=6, sticky="ew")
 
+        controls = ctk.CTkFrame(header, fg_color="transparent")
+        controls.grid(row=0, column=2, padx=(0, 8), pady=6, sticky="e")
+
         ctk.CTkCheckBox(
-            header,
+            controls,
             text="Timestamp",
             variable=self.serial_timestamps_var,
             width=90,
-        ).grid(row=0, column=2, padx=(0, 6), pady=6)
+        ).pack(side="left", padx=(0, 6))
 
         ctk.CTkCheckBox(
-            header,
+            controls,
             text="Pausa",
             variable=self.serial_freeze_var,
             width=70,
             command=self._toggle_serial_freeze,
-        ).grid(row=0, column=3, padx=(0, 6), pady=6)
+        ).pack(side="left", padx=(0, 6))
 
         ctk.CTkButton(
-            header,
+            controls,
             text="Limpiar",
             width=70,
             height=24,
             font=ctk.CTkFont(size=11),
             command=self._clear_serial_monitor,
-        ).grid(row=0, column=4, padx=(0, 8), pady=6)
+        ).pack(side="left", padx=(0, 8))
 
         ctk.CTkButton(
-            header,
+            controls,
             text="Detener",
             width=70,
             height=24,
@@ -1190,7 +1692,7 @@ class WillyApp(ctk.CTk):
             fg_color="#c0392b",
             hover_color="#922b21",
             command=self._stop_serial_monitor,
-        ).grid(row=0, column=5, padx=(0, 8), pady=6)
+        ).pack(side="left")
 
         output_frame = ctk.CTkFrame(win, fg_color=("gray95", "#0d1117"))
         output_frame.grid(row=1, column=0, sticky="nsew")
@@ -1217,24 +1719,24 @@ class WillyApp(ctk.CTk):
         output.configure(yscrollcommand=scrollbar.set)
 
         self.serial_window = win
-        self.serial_output_text = output
+        self.serial_popup_output_text = output
 
         def on_close() -> None:
-            self._stop_serial_monitor()
             self.serial_window = None
-            self.serial_output_text = None
+            self.serial_popup_output_text = None
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", on_close)
         self._serial_append_output("[Consola serial lista]\n")
 
     def _clear_serial_monitor(self) -> None:
-        if self.serial_output_text is None:
-            return
         self.serial_paused_buffer.clear()
-        self.serial_output_text.configure(state="normal")
-        self.serial_output_text.delete("1.0", "end")
-        self.serial_output_text.configure(state="disabled")
+        for widget in (self.serial_output_text, self.serial_popup_output_text):
+            if widget is None:
+                continue
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.configure(state="disabled")
 
     def _toggle_serial_freeze(self) -> None:
         if self.serial_freeze_var.get():
@@ -1270,13 +1772,14 @@ class WillyApp(ctk.CTk):
         return "".join(out)
 
     def _serial_append_output(self, text: str) -> None:
-        if self.serial_output_text is None:
-            return
-        self.serial_output_text.configure(state="normal")
-        self.serial_output_text.insert("end", text)
-        self.serial_output_text.configure(state="disabled")
-        if not self.serial_freeze_var.get():
-            self.serial_output_text.see("end")
+        for widget in (self.serial_output_text, self.serial_popup_output_text):
+            if widget is None:
+                continue
+            widget.configure(state="normal")
+            widget.insert("end", text)
+            widget.configure(state="disabled")
+            if not self.serial_freeze_var.get():
+                widget.see("end")
 
     def _on_serial_monitor_output(self, text: str) -> None:
         # Called from TerminalManager worker thread: always marshal to UI thread.
@@ -1305,44 +1808,13 @@ class WillyApp(ctk.CTk):
         self._device_poll_job = self.after(5000, self._trigger_device_scan)
 
     def _refresh_latest_schematic(self) -> None:
-        schem_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "outputs", "schematics")
-        latest_svg = ""
-        latest_bom = ""
-
-        try:
-            if os.path.isdir(schem_dir):
-                svgs = [
-                    os.path.join(schem_dir, name)
-                    for name in os.listdir(schem_dir)
-                    if name.lower().endswith(".svg")
-                ]
-                session_svgs = [
-                    path for path in svgs
-                    if os.path.getmtime(path) >= (self._app_session_start_ts - 1.0)
-                ]
-                if session_svgs:
-                    latest_svg = max(session_svgs, key=os.path.getmtime)
-
-                boms = [
-                    os.path.join(schem_dir, name)
-                    for name in os.listdir(schem_dir)
-                    if name.lower().endswith("_bom.csv")
-                ]
-                session_boms = [
-                    path for path in boms
-                    if os.path.getmtime(path) >= (self._app_session_start_ts - 1.0)
-                ]
-                if session_boms:
-                    latest_bom = max(session_boms, key=os.path.getmtime)
-        except Exception:
-            latest_svg = ""
-            latest_bom = ""
-
-        # Keep already-known generated paths in this session if scan didn't find newer files.
+        latest_svg, latest_bom, latest_net = self._find_latest_schematic_assets()
         if latest_svg:
             self._latest_schematic_path = latest_svg
         if latest_bom:
             self._latest_bom_path = latest_bom
+        if latest_net:
+            self._active_netlist_path = latest_net
 
         if hasattr(self, "diagram_status_label"):
             if self._latest_schematic_path and os.path.isfile(self._latest_schematic_path):
@@ -1354,8 +1826,83 @@ class WillyApp(ctk.CTk):
                 self.diagram_open_btn.configure(state="disabled")
 
         self._update_schematic_preview(self._latest_schematic_path)
+        self._update_wiring_summary()
+        self._refresh_flow_diagram_text()
 
         self._schedule_next_diagram_poll()
+
+    def _find_latest_schematic_assets(self) -> tuple[str, str, str]:
+        schem_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "outputs", "schematics")
+        if not os.path.isdir(schem_dir):
+            return "", "", ""
+
+        project_hint = os.path.basename(self._active_project_path).lower() if self._active_project_path else ""
+
+        def _latest(paths: list[str]) -> str:
+            return max(paths, key=os.path.getmtime) if paths else ""
+
+        def _pick(ext: str) -> str:
+            all_paths = [
+                os.path.join(schem_dir, name)
+                for name in os.listdir(schem_dir)
+                if name.lower().endswith(ext)
+            ]
+            if not all_paths:
+                return ""
+
+            session_paths = [
+                path for path in all_paths
+                if os.path.getmtime(path) >= (self._app_session_start_ts - 1.0)
+            ]
+            preferred = session_paths or all_paths
+            if project_hint:
+                related = [
+                    path for path in preferred
+                    if project_hint in os.path.basename(path).lower()
+                ]
+                if related:
+                    return _latest(related)
+            return _latest(preferred)
+
+        svg = _pick(".svg")
+        bom = _pick("_bom.csv")
+        net = _pick(".net")
+        return svg, bom, net
+
+    def _update_wiring_summary(self) -> None:
+        if not hasattr(self, "wiring_summary_text") or self.wiring_summary_text is None:
+            return
+
+        lines: list[str] = []
+        if self._active_project_path:
+            lines.append(f"Proyecto activo: {self._active_project_path}")
+        else:
+            lines.append("Proyecto activo: no detectado")
+
+        if self._active_netlist_path and os.path.isfile(self._active_netlist_path):
+            lines.append(f"Netlist: {os.path.basename(self._active_netlist_path)}")
+            try:
+                with open(self._active_netlist_path, "r", encoding="utf-8", errors="replace") as fh:
+                    net_lines = fh.readlines()
+                conn_lines = [ln.strip() for ln in net_lines if "->" in ln]
+                if conn_lines:
+                    lines.append("")
+                    lines.append("Conexiones:")
+                    lines.extend(conn_lines[:20])
+            except Exception as exc:
+                lines.append(f"No se pudo leer netlist: {exc}")
+        else:
+            lines.append("Netlist: no disponible para este proyecto")
+
+        if self._latest_bom_path and os.path.isfile(self._latest_bom_path):
+            lines.append("")
+            lines.append(f"BOM: {os.path.basename(self._latest_bom_path)}")
+
+        text = "\n".join(lines)
+        self.wiring_summary_text.configure(state="normal")
+        self.wiring_summary_text.delete("0.0", "end")
+        self.wiring_summary_text.insert("0.0", text)
+        self.wiring_summary_text.configure(state="disabled")
 
     def _handle_tk_exception(self, exc_type, exc_value, exc_tb) -> None:
         tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
@@ -1464,6 +2011,8 @@ class WillyApp(ctk.CTk):
             self._code_expand_text.insert("0.0", preview)
             self._code_expand_text.configure(state="disabled")
 
+        self._refresh_flow_diagram_text()
+
     def _clippy_default_position(self) -> tuple[int, int]:
         return 8, 48
 
@@ -1538,7 +2087,8 @@ class WillyApp(ctk.CTk):
         """Open the improved settings dialog with validation and sync."""
         settings_window = ctk.CTkToplevel(self)
         settings_window.title(i18n.get("settings_title"))
-        settings_window.geometry("560x460")
+        settings_window.geometry("620x520")
+        settings_window.minsize(560, 460)
         settings_window.transient(self)
         settings_window.update_idletasks()
 
@@ -1549,7 +2099,7 @@ class WillyApp(ctk.CTk):
                 pass
 
         settings_window.after(0, _safe_grab_set)
-        settings_window.resizable(False, False)
+        settings_window.resizable(True, True)
 
         frame = ctk.CTkFrame(settings_window, corner_radius=14)
         frame.pack(fill="both", expand=True, padx=18, pady=18)
@@ -1571,7 +2121,7 @@ class WillyApp(ctk.CTk):
             anchor="w",
         ).pack(anchor="w", pady=(2, 0))
 
-        body = ctk.CTkFrame(frame, fg_color="transparent")
+        body = ctk.CTkScrollableFrame(frame, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=18, pady=(4, 10))
 
         # API Key
@@ -1583,8 +2133,36 @@ class WillyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             anchor="w"
         ).pack(anchor="w", padx=12, pady=(10, 2))
+        api_source_actual = _resolve_api_source(self.config_data)
+        api_source_var = tk.StringVar(value=api_source_actual)
         api_key_var = tk.StringVar(value=self.config_data.get("openai_api_key", ""))
         api_key_visible = tk.BooleanVar(value=False)
+
+        source_row = ctk.CTkFrame(api_card, fg_color="transparent")
+        source_row.pack(anchor="w", fill="x", padx=12, pady=(0, 6))
+
+        ctk.CTkLabel(
+            source_row,
+            text=i18n.get("settings_api_source"),
+            font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"),
+        ).pack(side="left", padx=(0, 8))
+
+        source_labels = {
+            "env": i18n.get("api_source_env"),
+            "config": i18n.get("api_source_config"),
+        }
+        source_from_label = {label: key for key, label in source_labels.items()}
+        source_label_var = tk.StringVar(value=source_labels.get(api_source_actual, source_labels["env"]))
+
+        source_menu = ctk.CTkOptionMenu(
+            source_row,
+            values=[source_labels["env"], source_labels["config"]],
+            variable=source_label_var,
+            width=240,
+            command=lambda label: api_source_var.set(source_from_label.get(label, "env")),
+        )
+        source_menu.pack(side="left")
 
         api_row = ctk.CTkFrame(api_card, fg_color="transparent")
         api_row.pack(anchor="w", fill="x", padx=12, pady=(0, 8))
@@ -1613,9 +2191,16 @@ class WillyApp(ctk.CTk):
         )
         toggle_btn.pack(side="left")
 
+        locked_keys = getattr(self, "_locked_config_keys", set())
+        if "api_key_source" in locked_keys:
+            source_menu.configure(state="disabled")
+        if "openai_api_key" in locked_keys:
+            api_key_entry.configure(state="disabled")
+            toggle_btn.configure(state="disabled")
+
         ctk.CTkLabel(
             api_card,
-            text="Tip: mantenla oculta al compartir pantalla.",
+            text="Tip: usa Variable de entorno para laboratorios y equipos compartidos.",
             font=ctk.CTkFont(size=10),
             text_color=("gray45", "gray65"),
             anchor="w",
@@ -1645,14 +2230,19 @@ class WillyApp(ctk.CTk):
             if folder:
                 folder_var.set(folder)
 
-        ctk.CTkButton(
+        browse_btn = ctk.CTkButton(
             folder_row,
             text=i18n.get("browse_btn") if hasattr(i18n, "get") else "Examinar",
             width=110,
             fg_color=("gray70", "gray35"),
             hover_color=("gray60", "gray45"),
             command=select_folder,
-        ).pack(side="left")
+        )
+        browse_btn.pack(side="left")
+
+        if "initial_directory" in locked_keys:
+            folder_entry.configure(state="disabled")
+            browse_btn.configure(state="disabled")
 
         ctk.CTkLabel(
             folder_card,
@@ -1661,6 +2251,207 @@ class WillyApp(ctk.CTk):
             text_color=("gray45", "gray65"),
             anchor="w",
         ).pack(anchor="w", padx=12, pady=(0, 10))
+
+        # Security profile
+        security_card = ctk.CTkFrame(body, corner_radius=12, fg_color=("gray93", "gray17"))
+        security_card.pack(fill="x", pady=(10, 0))
+        ctk.CTkLabel(
+            security_card,
+            text=i18n.get("settings_security_profile"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+
+        security_labels = {
+            "lab_safe": i18n.get("security_profile_lab_safe"),
+            "standard": i18n.get("security_profile_standard"),
+            "permissive": i18n.get("security_profile_permissive"),
+        }
+        security_from_label = {label: key for key, label in security_labels.items()}
+        current_profile = str(self.config_data.get("security_profile", "lab_safe")).strip().lower()
+        if current_profile not in security_labels:
+            current_profile = "lab_safe"
+        security_profile_var = tk.StringVar(value=current_profile)
+        security_label_var = tk.StringVar(value=security_labels[current_profile])
+
+        security_row = ctk.CTkFrame(security_card, fg_color="transparent")
+        security_row.pack(anchor="w", fill="x", padx=12, pady=(0, 8))
+
+        security_menu = ctk.CTkOptionMenu(
+            security_row,
+            values=[
+                security_labels["lab_safe"],
+                security_labels["standard"],
+                security_labels["permissive"],
+            ],
+            variable=security_label_var,
+            width=300,
+            command=lambda label: security_profile_var.set(
+                security_from_label.get(label, "lab_safe")
+            ),
+        )
+        security_menu.pack(side="left")
+        if "security_profile" in locked_keys:
+            security_menu.configure(state="disabled")
+
+        ctk.CTkLabel(
+            security_card,
+            text=i18n.get("settings_security_hint"),
+            font=ctk.CTkFont(size=10),
+            text_color=("gray45", "gray65"),
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
+        role_card = ctk.CTkFrame(body, corner_radius=12, fg_color=("gray93", "gray17"))
+        role_card.pack(fill="x", pady=(10, 0))
+        ctk.CTkLabel(
+            role_card,
+            text=i18n.get("settings_operation_role"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+
+        role_labels = {
+            "student": i18n.get("operation_role_student"),
+            "instructor": i18n.get("operation_role_instructor"),
+            "admin": i18n.get("operation_role_admin"),
+        }
+        role_from_label = {label: key for key, label in role_labels.items()}
+        current_role = str(self.config_data.get("operation_role", "instructor")).strip().lower()
+        if current_role not in role_labels:
+            current_role = "instructor"
+        operation_role_var = tk.StringVar(value=current_role)
+        operation_role_label_var = tk.StringVar(value=role_labels[current_role])
+
+        role_row = ctk.CTkFrame(role_card, fg_color="transparent")
+        role_row.pack(anchor="w", fill="x", padx=12, pady=(0, 8))
+
+        role_menu = ctk.CTkOptionMenu(
+            role_row,
+            values=[
+                role_labels["student"],
+                role_labels["instructor"],
+                role_labels["admin"],
+            ],
+            variable=operation_role_label_var,
+            width=300,
+            command=lambda label: operation_role_var.set(
+                role_from_label.get(label, "instructor")
+            ),
+        )
+        role_menu.pack(side="left")
+        if "operation_role" in locked_keys:
+            role_menu.configure(state="disabled")
+
+        ctk.CTkLabel(
+            role_card,
+            text=i18n.get("settings_operation_role_hint"),
+            font=ctk.CTkFont(size=10),
+            text_color=("gray45", "gray65"),
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
+        audit_card = ctk.CTkFrame(body, corner_radius=12, fg_color=("gray93", "gray17"))
+        audit_card.pack(fill="x", pady=(10, 0))
+        ctk.CTkLabel(
+            audit_card,
+            text=i18n.get("settings_audit_export"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+
+        ctk.CTkLabel(
+            audit_card,
+            text=i18n.get("settings_audit_hint"),
+            font=ctk.CTkFont(size=10),
+            text_color=("gray45", "gray65"),
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        audit_status_var = tk.StringVar(value="")
+
+        def export_audit(days: int | None = None) -> None:
+            now = datetime.now()
+            start_iso = ""
+            suffix = "all"
+            if days is not None:
+                start_iso = (now - timedelta(days=days)).isoformat(timespec="seconds")
+                suffix = f"last_{days}d"
+
+            if days == 0:
+                start_iso = datetime.fromtimestamp(
+                    self._app_session_start_ts
+                ).isoformat(timespec="seconds")
+                suffix = "current_session"
+
+            end_iso = now.isoformat(timespec="seconds")
+            os.makedirs(AUDIT_OUTPUT_DIR, exist_ok=True)
+            stamp = now.strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(
+                AUDIT_OUTPUT_DIR,
+                f"willy_audit_{suffix}_{stamp}.json",
+            )
+
+            try:
+                path = self.session_logger.export_audit_report(
+                    output_path,
+                    start_iso=start_iso or None,
+                    end_iso=end_iso,
+                )
+                audit_status_var.set(i18n.get("audit_export_ok", path=path))
+            except Exception as exc:
+                audit_status_var.set(i18n.get("audit_export_error", error=str(exc)))
+
+        audit_btn_row = ctk.CTkFrame(audit_card, fg_color="transparent")
+        audit_btn_row.pack(anchor="w", padx=12, pady=(0, 8))
+
+        ctk.CTkButton(
+            audit_btn_row,
+            text=i18n.get("export_audit_7d_btn"),
+            width=170,
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=lambda: export_audit(days=7),
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            audit_btn_row,
+            text=i18n.get("export_audit_session_btn"),
+            width=210,
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=lambda: export_audit(days=0),
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            audit_card,
+            textvariable=audit_status_var,
+            font=ctk.CTkFont(size=10),
+            text_color=("gray35", "gray75"),
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
+        if locked_keys:
+            ctk.CTkLabel(
+                frame,
+                text=i18n.get(
+                    "settings_locked_notice",
+                    keys=", ".join(sorted(locked_keys)),
+                ),
+                font=ctk.CTkFont(size=10),
+                text_color=("#8a5a00", "#f5c26b"),
+                anchor="w",
+                justify="left",
+                wraplength=560,
+            ).pack(anchor="w", padx=20, pady=(0, 6))
 
         # Feedback label
         feedback_var = tk.StringVar(value="")
@@ -1697,8 +2488,32 @@ class WillyApp(ctk.CTk):
                 feedback_var.set("No tienes permisos de escritura en la carpeta.")
                 return
             # Guardar config
-            self.config_data["openai_api_key"] = api_key_var.get()
-            self.config_data["initial_directory"] = folder
+            selected_source = api_source_var.get().strip().lower() or "env"
+            if selected_source not in {"env", "config"}:
+                selected_source = "env"
+
+            api_key_value = api_key_var.get().strip()
+            if "api_key_source" not in locked_keys:
+                self.config_data["api_key_source"] = selected_source
+            selected_source = self.config_data.get("api_key_source", "env")
+
+            # Security default: if source is env, avoid persisting secrets in config.
+            if "openai_api_key" not in locked_keys:
+                if selected_source == "env":
+                    self.config_data["openai_api_key"] = ""
+                else:
+                    self.config_data["openai_api_key"] = api_key_value
+
+            if "initial_directory" not in locked_keys:
+                self.config_data["initial_directory"] = folder
+            if "security_profile" not in locked_keys:
+                self.config_data["security_profile"] = (
+                    security_profile_var.get().strip().lower() or "lab_safe"
+                )
+            if "operation_role" not in locked_keys:
+                self.config_data["operation_role"] = (
+                    operation_role_var.get().strip().lower() or "instructor"
+                )
             with open(CONFIG_PATH, "w", encoding="utf-8") as config_file:
                 json.dump(self.config_data, config_file, indent=4)
             # Sincronizar terminal y file browser

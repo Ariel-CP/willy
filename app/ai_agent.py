@@ -6,6 +6,8 @@ import html
 import json
 import os
 import platform
+import re
+import shlex
 import threading
 import time
 import logging
@@ -21,6 +23,86 @@ from app.iot_diagram_manager import IoTDiagramManager
 
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_BLOCKED_PATTERNS = [
+    r"(^|\s)rm\s+-rf\s+(/|~|\.\.?)(\s|$)",
+    r"(^|\s)sudo\s+rm\s+-rf\s+",
+    r"(^|\s)del\s+/f\s+/s\s+/q\s+",
+    r"(^|\s)format(\.com)?\s+",
+    r"(^|\s)mkfs(\.[A-Za-z0-9_]+)?\s+",
+    r"(^|\s)diskpart(\s|$)",
+    r"(^|\s)shutdown(\s|$)",
+    r"(^|\s)reboot(\s|$)",
+    r"(^|\s)poweroff(\s|$)",
+    r"(^|\s)reg\s+delete\s+",
+    r":\(\)\s*\{\s*:\|:\s*&\s*\};:\s*",
+]
+
+DEFAULT_ALLOWED_COMMANDS = {
+    "windows": {
+        "powershell", "pwsh", "cmd", "python", "python3", "pip", "pip3",
+        "pio", "platformio", "git", "type", "dir", "where", "echo", "more",
+        "findstr", "copy", "move", "ren", "mkdir", "rmdir", "tasklist",
+    },
+    "linux": {
+        "python", "python3", "pip", "pip3", "pio", "platformio", "git", "ls",
+        "pwd", "cat", "echo", "grep", "find", "cp", "mv", "mkdir", "rmdir",
+        "touch", "chmod", "chown", "bash", "sh", "uname", "df", "free", "ps",
+        "top", "htop", "whoami",
+    },
+    "darwin": {
+        "python", "python3", "pip", "pip3", "pio", "platformio", "git", "ls",
+        "pwd", "cat", "echo", "grep", "find", "cp", "mv", "mkdir", "rmdir",
+        "touch", "chmod", "chown", "bash", "sh", "uname", "df", "free", "ps",
+        "top", "whoami",
+    },
+}
+ROLE_TOOL_ALLOWLIST = {
+    "student": {
+        "read_file",
+        "list_directory",
+        "change_directory",
+        "get_weather",
+        "search_web",
+        "fetch_webpage",
+        "detect_microcontroller",
+        "build_microcontroller",
+        "scan_i2c_bus",
+        "generate_iot_schematic",
+    },
+    "instructor": {
+        "run_command",
+        "read_file",
+        "write_file",
+        "list_directory",
+        "change_directory",
+        "get_weather",
+        "search_web",
+        "fetch_webpage",
+        "detect_microcontroller",
+        "build_microcontroller",
+        "upload_microcontroller",
+        "flash_sketch_file",
+        "scan_i2c_bus",
+        "generate_iot_schematic",
+    },
+    "admin": {
+        "run_command",
+        "read_file",
+        "write_file",
+        "list_directory",
+        "change_directory",
+        "get_weather",
+        "search_web",
+        "fetch_webpage",
+        "detect_microcontroller",
+        "build_microcontroller",
+        "upload_microcontroller",
+        "flash_sketch_file",
+        "scan_i2c_bus",
+        "generate_iot_schematic",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Tool schemas
@@ -370,6 +452,8 @@ Runtime context:
 - Operating System: {os_name}
 - OS Version: {os_version}
 - Platform: {platform_name}
+- Working Directory: {working_directory}
+- Configured Initial Directory: {configured_initial_directory}
 
 You MUST adapt commands and instructions to this runtime OS. Do not suggest Linux-only commands on Windows, and do not suggest PowerShell-only commands on Linux.
 
@@ -524,6 +608,7 @@ class AIAgent:
         self._last_success_project_path = ""
         self._last_success_port = ""
         self._last_success_env = ""
+        self._history_limit = int(self.config.get("max_history_messages", 60) or 60)
 
     def _emit_progress(self, percent: float, detail: str = "") -> None:
         """Send monotonic progress updates to the UI (0-100)."""
@@ -556,12 +641,31 @@ class AIAgent:
         self.system_prompt = self._build_system_prompt()
         self.history = [{"role": "system", "content": self.system_prompt}]
 
+    def _append_history(self, item: dict) -> None:
+        """Append and trim conversation history to keep context bounded."""
+        self.history.append(item)
+        if len(self.history) <= self._history_limit:
+            return
+
+        system_message = self.history[0] if self.history else {"role": "system", "content": self.system_prompt}
+        tail_size = max(1, self._history_limit - 1)
+        tail = self.history[-tail_size:]
+        self.history = [system_message] + tail
+
     def _detect_runtime_context(self) -> dict[str, str]:
         """Detect runtime OS details so the model can adapt commands."""
+        configured_initial = str(self.config.get("initial_directory", "~") or "~")
+        try:
+            working_directory = self.tm.get_cwd()
+        except Exception:
+            working_directory = os.path.expanduser(configured_initial)
+
         return {
             "os_name": platform.system() or "Unknown",
             "os_version": platform.release() or "Unknown",
             "platform_name": platform.platform() or "Unknown",
+            "working_directory": working_directory,
+            "configured_initial_directory": os.path.expanduser(configured_initial),
         }
 
     def _build_system_prompt(self) -> str:
@@ -673,7 +777,7 @@ class AIAgent:
         return confirmed
 
     def _process(self, user_text: str) -> None:
-        self.history.append({"role": "user", "content": user_text})
+        self._append_history({"role": "user", "content": user_text})
         self.on_status(i18n.get("ai_thinking"))
         self._progress_value = 0.0
         self._emit_progress(5, "Analizando solicitud")
@@ -717,7 +821,7 @@ class AIAgent:
                     raise
 
                 msg = response.choices[0].message
-                self.history.append(msg.to_dict())
+                self._append_history(msg.to_dict())
 
                 # Check for plan in assistant's response
                 assistant_text = msg.content or ""
@@ -746,7 +850,7 @@ class AIAgent:
                             # User confirmed — set flag to skip confirmations for next commands
                             self.awaiting_plan_confirmation = False
                             # Force immediate execution on next loop (avoid re-planning loop).
-                            self.history.append({
+                            self._append_history({
                                 "role": "user",
                                 "content": "Plan confirmed in UI. Execute now directly with tools and do not ask for confirmation in chat.",
                             })
@@ -777,7 +881,7 @@ class AIAgent:
                                 "Blocked repeated tool call: la misma llamada ya fallo en este turno. "
                                 "Ajusta project_path/port/env o aplica otra estrategia antes de reintentar."
                             )
-                            self.history.append({
+                            self._append_history({
                                 "role": "tool",
                                 "tool_call_id": tc.id,
                                 "content": result,
@@ -797,7 +901,7 @@ class AIAgent:
                         if self._tool_result_is_failure(result):
                             failed_tool_fingerprints.add(fingerprint)
 
-                        self.history.append({
+                        self._append_history({
                             "role": "tool",
                             "tool_call_id": tc.id,
                             "content": result,
@@ -870,9 +974,8 @@ class AIAgent:
 
         if (has_manual_ide_flow or has_manual_platformio_dep_flow) and has_dependency_context:
             return (
-                "Willy mantendra un flujo automatico con PlatformIO (sin pasos manuales en IDE externo).\n"
-                "Si la dependencia falla, aplicara correccion de alias, reintentos y fallback de version automaticamente, "
-                "y mostrara el error tecnico final para diagnostico."
+                "Se omitieron pasos manuales de librerías para evitar desviar el flujo.\n"
+                "Continuemos con diagnóstico y corrección automática en PlatformIO mostrando salida técnica completa."
             )
 
         return text
@@ -891,6 +994,24 @@ class AIAgent:
         self._last_assistant_text = msg
         self._last_assistant_ts = now
         self.on_message("assistant", text)
+
+    def _emit_terminal_line(self, text: str) -> None:
+        """Write an informational line to terminal panel when available."""
+        if not text:
+            return
+        try:
+            callback = getattr(self.tm, "output_callback", None)
+            if callable(callback):
+                callback(text if text.endswith("\n") else f"{text}\n")
+        except Exception:
+            pass
+
+    def _emit_terminal_block(self, title: str, content: str) -> None:
+        """Write a titled block to terminal panel."""
+        if not content:
+            return
+        self._emit_terminal_line(f"[WILLY][IoT] {title}")
+        self._emit_terminal_line(content)
 
     def _tool_call_fingerprint(self, tool_call) -> str:
         """Create a stable fingerprint from tool name + normalized arguments."""
@@ -917,6 +1038,20 @@ class AIAgent:
 
     def _dispatch_tool(self, tool_call) -> str:
         name = tool_call.function.name
+        if not self._is_tool_allowed_for_role(name):
+            role = self._operation_role()
+            self._log_event(
+                "tool_blocked_role",
+                {
+                    "tool": name,
+                    "role": role,
+                },
+            )
+            return (
+                f"Error: tool '{name}' blocked by role policy "
+                f"(operation_role={role})."
+            )
+
         try:
             args = json.loads(tool_call.function.arguments)
         except json.JSONDecodeError:
@@ -953,6 +1088,10 @@ class AIAgent:
         # Skip confirmation if plan was just confirmed (within 5 minute window)
         if self.skip_confirmations_until is not None and time.time() < self.skip_confirmations_until:
             return False
+
+        # Security-first default for shared lab environments.
+        if self.config.get("require_command_confirmation", True):
+            return True
         
         if self.config.get("confirm_readonly", False):
             return True
@@ -960,11 +1099,107 @@ class AIAgent:
         first_token = command.strip().split()[0] if command.strip() else ""
         return first_token in always
 
+    def _security_profile(self) -> str:
+        profile = str(self.config.get("security_profile", "lab_safe")).strip().lower()
+        if profile in {"lab_safe", "standard", "permissive"}:
+            return profile
+        return "lab_safe"
+
+    def _operation_role(self) -> str:
+        role = str(self.config.get("operation_role", "instructor")).strip().lower()
+        if role in {"student", "instructor", "admin"}:
+            return role
+        return "instructor"
+
+    def _is_tool_allowed_for_role(self, tool_name: str) -> bool:
+        role = self._operation_role()
+        allowed = ROLE_TOOL_ALLOWLIST.get(role, set())
+        return tool_name in allowed
+
+    def _first_token(self, command: str) -> str:
+        text = (command or "").strip()
+        if not text:
+            return ""
+        try:
+            parts = shlex.split(text, posix=(platform.system() != "Windows"))
+            if parts:
+                return parts[0].lower()
+        except Exception:
+            pass
+        return text.split()[0].lower()
+
+    def _allowed_commands_for_os(self) -> set[str]:
+        os_key = (platform.system() or "").strip().lower()
+        allowed = set(DEFAULT_ALLOWED_COMMANDS.get(os_key, set()))
+
+        custom = self.config.get("allowed_commands_by_os", {})
+        if isinstance(custom, dict):
+            entries = custom.get(os_key, [])
+            if isinstance(entries, list):
+                allowed = {str(x).strip().lower() for x in entries if str(x).strip()}
+        return allowed
+
+    def _matches_blocked_pattern(self, command: str) -> tuple[bool, str]:
+        text = (command or "").strip()
+        all_patterns = list(DEFAULT_BLOCKED_PATTERNS)
+
+        custom = self.config.get("blocked_command_patterns", [])
+        if isinstance(custom, list):
+            for item in custom:
+                value = str(item).strip()
+                if value:
+                    all_patterns.append(value)
+
+        for pattern in all_patterns:
+            try:
+                if re.search(pattern, text, flags=re.IGNORECASE):
+                    return True, pattern
+            except re.error:
+                continue
+        return False, ""
+
+    def _validate_command_policy(self, command: str) -> tuple[bool, str]:
+        profile = self._security_profile()
+        if profile == "permissive":
+            return True, ""
+
+        blocked, pattern = self._matches_blocked_pattern(command)
+        if blocked:
+            return False, f"blocked dangerous pattern ({pattern})"
+
+        if profile == "standard":
+            return True, ""
+
+        # lab_safe profile: allowlist by OS + explicit dangerous-pattern block.
+        token = self._first_token(command)
+        allowed = self._allowed_commands_for_os()
+        if token and token in allowed:
+            return True, ""
+
+        if token:
+            return False, (
+                f"command '{token}' is not allowed in security_profile=lab_safe. "
+                "Use security_profile=standard/permissive or extend allowed_commands_by_os."
+            )
+        return False, "empty command token"
+
     def _tool_run_command(self, args: dict) -> str:
         command = args.get("command", "").strip()
         if not command:
             return "Error: empty command."
         command = self._normalize_command_for_platform(command)
+        allowed, reason = self._validate_command_policy(command)
+        if not allowed:
+            self._log_event("command_blocked", {
+                "command": command,
+                "reason": reason,
+                                "operation_role": self._operation_role(),
+                "security_profile": self._security_profile(),
+            })
+            return (
+                "Error: command blocked by security policy. "
+                f"Reason: {reason}"
+            )
         background = args.get("background", False)
 
         if self._needs_confirmation(command):
@@ -999,10 +1234,22 @@ class AIAgent:
         self.tm.output_callback = collect
         try:
             if background:
+                self._log_event("command_executed", {
+                    "command": command,
+                    "background": True,
+                    "operation_role": self._operation_role(),
+                    "security_profile": self._security_profile(),
+                })
                 self.tm.run_command_async(command)
                 return f"Command started in background: {command}"
             else:
                 self.tm.run_command(command)
+                self._log_event("command_executed", {
+                    "command": command,
+                    "background": False,
+                    "operation_role": self._operation_role(),
+                    "security_profile": self._security_profile(),
+                })
         finally:
             self.tm.output_callback = original_cb
 
@@ -1126,6 +1373,11 @@ class AIAgent:
     def _tool_change_directory(self, args: dict) -> str:
         path = args.get("path", "~").strip()
         result = self.tm.change_directory(path)
+        if not str(result).startswith("cd: no such directory"):
+            self.runtime_context = self._detect_runtime_context()
+            self.system_prompt = self._build_system_prompt()
+            if self.history and self.history[0].get("role") == "system":
+                self.history[0] = {"role": "system", "content": self.system_prompt}
         return f"Changed directory to: {result}"
 
     def _tool_get_weather(self, args: dict) -> str:
@@ -1478,9 +1730,13 @@ class AIAgent:
             env_arg or "",
             env or "default",
         )
+        self._emit_terminal_line(
+            f"[WILLY][IoT] Build iniciado | project={project_path} | env={env or 'default'}"
+        )
         
         try:
             result = self.arduino_manager.build_sketch(project_path, env)
+            self._emit_terminal_block("Build output", result.get("output", ""))
             if result["ok"]:
                 self._remember_iot_success(project_path=project_path, env=env or "")
                 logger.info("Tool build_microcontroller: success env=%s", env or "default")
@@ -1500,13 +1756,11 @@ class AIAgent:
                 output_text = result.get("output", "")
                 error_text = result.get("error", "")
                 auto_note = self._auto_recovery_note(output_text, error_text)
-                flow_note = self._platformio_dependency_flow_note()
                 technical_error = self._final_technical_error(error_text, output_text)
                 if env_note:
                     return (
                         f"✗ Build failed: {result['error']}\n"
                         f"{project_note}\n"
-                        f"{flow_note}\n"
                         f"{auto_note}\n"
                         f"Error tecnico final: {technical_error}\n"
                         f"{env_note}\n\n"
@@ -1516,14 +1770,12 @@ class AIAgent:
                     return (
                         f"✗ Build failed: {result['error']}\n"
                         f"{project_note}\n"
-                        f"{flow_note}\n"
                         f"{auto_note}\n\n"
                         f"Error tecnico final: {technical_error}\n\n"
                         f"{result['output']}"
                     )
                 return (
                     f"✗ Build failed: {result['error']}\n"
-                    f"{flow_note}\n"
                     f"{auto_note}\n\n"
                     f"Error tecnico final: {technical_error}\n\n"
                     f"{result['output']}"
@@ -1569,6 +1821,9 @@ class AIAgent:
             env_arg or "",
             env or "default",
         )
+        self._emit_terminal_line(
+            f"[WILLY][IoT] Upload iniciado | project={project_path} | env={env or 'default'} | port={port}"
+        )
 
         # Ask for confirmation
         confirmed_event = threading.Event()
@@ -1591,6 +1846,7 @@ class AIAgent:
         
         try:
             result = self.arduino_manager.upload_firmware(project_path, port, env)
+            self._emit_terminal_block("Upload output", result.get("output", ""))
             if result["ok"]:
                 self._remember_iot_success(project_path=project_path, env=env or "", port=port)
                 logger.info("Tool upload_microcontroller: success env=%s port=%s", env or "default", port)
@@ -1607,12 +1863,10 @@ class AIAgent:
                 output_text = result.get("output", "")
                 error_text = result.get("error", "")
                 auto_note = self._auto_recovery_note(output_text, error_text)
-                flow_note = self._platformio_dependency_flow_note()
                 technical_error = self._final_technical_error(error_text, output_text)
                 return (
                     f"✗ Upload failed: {result['error']}\n"
                     f"{project_note}\n"
-                    f"{flow_note}\n"
                     f"{auto_note}\n\n"
                     f"Error tecnico final: {technical_error}\n\n"
                     f"{result['output']}"
@@ -1702,11 +1956,7 @@ class AIAgent:
             return f"Error scanning I2C bus: {exc}"
 
     def _platformio_dependency_flow_note(self) -> str:
-        return (
-            "Willy mantendra un flujo automatico con PlatformIO (sin pasos manuales en IDE externo).\n"
-            "Si la dependencia falla, aplicara correccion de alias, reintentos y fallback de version automaticamente, "
-            "y mostrara el error tecnico final para diagnostico."
-        )
+        return ""
 
     def _final_technical_error(self, error: str, output: str) -> str:
         """Return a concise final technical error line for diagnostics."""
@@ -1771,6 +2021,10 @@ class AIAgent:
         if not port:
             port = self.config.get("default_port", "/dev/ttyUSB0")
 
+        self._emit_terminal_line(
+            f"[WILLY][IoT] Flash sketch iniciado | sketch={sketch_path} | board={board} | port={port}"
+        )
+
         confirm_lines = [
             f"Sketch: {sketch_path}",
             f"Project: {project_path or '(same folder as sketch)'}",
@@ -1800,12 +2054,14 @@ class AIAgent:
             project_path=project_path or None,
             board=board,
         )
+        self._emit_terminal_block("Preparacion de proyecto", prep.get("output", ""))
         if not prep.get("ok"):
             return f"✗ Preparation failed: {prep.get('error', 'unknown error')}\n\n{prep.get('output', '')}"
 
         proj = prep.get("project_path", project_path)
         env, env_note = self._resolve_project_env(proj, requested_env=env_arg, port=port)
         result = self.arduino_manager.upload_firmware(proj, port, env)
+        self._emit_terminal_block("Build/Upload output", result.get("output", ""))
         if not result.get("ok"):
             return (
                 f"✗ Upload failed: {result.get('error', 'unknown error')}\n"
@@ -1867,11 +2123,14 @@ class AIAgent:
         """Best-effort local logging for debugging tool-call failures."""
         try:
             stamp = datetime.now().isoformat(timespec="seconds")
+            enriched_payload = dict(payload or {})
+            enriched_payload.setdefault("operation_role", self._operation_role())
+            enriched_payload.setdefault("security_profile", self._security_profile())
             line = json.dumps(
                 {
                     "timestamp": stamp,
                     "event": event_type,
-                    "payload": payload,
+                    "payload": enriched_payload,
                 },
                 ensure_ascii=False,
             )

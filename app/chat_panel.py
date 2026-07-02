@@ -17,6 +17,7 @@ class ConfirmDialog(ctk.CTkToplevel):
         super().__init__(master)
         self.title(title)
         self.resizable(False, False)
+        self.minsize(520, 280)
         self.grab_set()
         self._callback = callback
 
@@ -36,13 +37,15 @@ class ConfirmDialog(ctk.CTkToplevel):
             fg_color=("gray90", "#161b22"),
             border_color=("gray70", "gray40"),
             border_width=1,
+            wrap="word",
         )
         detail_box.grid(row=1, column=0, padx=20, pady=8, sticky="ew")
         detail_box.insert("0.0", detail)
         detail_box.configure(state="disabled")
 
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.grid(row=2, column=0, padx=20, pady=(4, 16), sticky="e")
+        btn_frame.grid(row=2, column=0, padx=20, pady=(4, 16), sticky="ew")
+        btn_frame.grid_columnconfigure(0, weight=1)
 
         ctk.CTkButton(
             btn_frame,
@@ -51,7 +54,7 @@ class ConfirmDialog(ctk.CTkToplevel):
             fg_color=("gray70", "gray35"),
             hover_color=("gray60", "gray45"),
             command=self._cancel,
-        ).pack(side="left", padx=(0, 8))
+        ).grid(row=0, column=1, padx=(0, 8), sticky="e")
 
         ctk.CTkButton(
             btn_frame,
@@ -60,7 +63,7 @@ class ConfirmDialog(ctk.CTkToplevel):
             fg_color="#16a34a",
             hover_color="#15803d",
             command=self._confirm,
-        ).pack(side="left")
+        ).grid(row=0, column=2, sticky="e")
 
         self._center()
 
@@ -107,6 +110,9 @@ class ChatPanel(ctk.CTkFrame):
         self._tts_callback: Callable[[str], None] | None = None
         self._tts_on = False  # default, overwritten in _build_ui
         self._vol_callback: Callable[[float], None] | None = None
+        self._input_min_height = 36
+        self._input_max_height = 220
+        self._input_resize_after_id = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -190,22 +196,24 @@ class ChatPanel(ctk.CTkFrame):
         self.scroll_frame.grid_columnconfigure(0, weight=1)
         self._msg_row = 0
 
-        input_frame = ctk.CTkFrame(self, fg_color=("gray90", "gray15"), height=48)
+        input_frame = ctk.CTkFrame(self, fg_color=("gray90", "gray15"))
         input_frame.grid(row=2, column=0, sticky="ew")
         input_frame.grid_columnconfigure(0, weight=1)
 
         self.input_box = ctk.CTkTextbox(
             input_frame,
-            height=36,
+            height=self._input_min_height,
             font=ctk.CTkFont(size=13),
             fg_color=("gray95", "#161b22"),
             border_color=("gray70", "gray30"),
             border_width=1,
             wrap="word",
+            activate_scrollbars=True,
         )
         self.input_box.grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=6)
         self.input_box.bind("<Return>", self._on_return)
         self.input_box.bind("<Shift-Return>", lambda e: None)
+        self.input_box.bind("<KeyRelease>", self._on_input_changed)
 
         ctk.CTkButton(
             input_frame,
@@ -215,6 +223,7 @@ class ChatPanel(ctk.CTkFrame):
             font=ctk.CTkFont(size=13),
             command=self._send,
         ).grid(row=0, column=1, padx=(0, 8), pady=6)
+        self._auto_resize_input_box()
 
     def set_send_callback(self, cb: Callable[[str], None]) -> None:
         self._send_callback = cb
@@ -336,6 +345,7 @@ class ChatPanel(ctk.CTkFrame):
         if not text:
             return
         self.input_box.delete("0.0", "end")
+        self._auto_resize_input_box(force_min=True)
         self._add_bubble("user", text)
         if self._send_callback:
             self._send_callback(text)
@@ -345,6 +355,42 @@ class ChatPanel(ctk.CTkFrame):
             self._send()
             return "break"
         return None
+
+    def _on_input_changed(self, _event=None) -> None:
+        if self._input_resize_after_id is not None:
+            try:
+                self.after_cancel(self._input_resize_after_id)
+            except Exception:
+                pass
+            self._input_resize_after_id = None
+        self._input_resize_after_id = self.after(16, self._auto_resize_input_box)
+
+    def _auto_resize_input_box(self, force_min: bool = False) -> None:
+        try:
+            if force_min:
+                target = self._input_min_height
+            else:
+                self.input_box.update_idletasks()
+                display_lines = int(
+                    self.input_box._textbox.count(
+                        "1.0",
+                        "end-1c",
+                        "displaylines",
+                    )[0]
+                )
+                if display_lines < 1:
+                    display_lines = 1
+                target = max(
+                    self._input_min_height,
+                    min(self._input_max_height, display_lines * 22 + 12),
+                )
+
+            current = int(self.input_box.cget("height"))
+            if current != target:
+                self.input_box.configure(height=target)
+            self.input_box._textbox.see("insert")
+        except Exception:
+            pass
 
     def _clear_chat(self) -> None:
         for widget in self.scroll_frame.winfo_children():

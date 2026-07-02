@@ -200,7 +200,6 @@ def test_build_failure_reports_automatic_dependency_recovery_note() -> None:
 
     assert "Build failed" in msg
     assert "Willy aplico recuperacion automatica" in msg
-    assert "Willy mantendra un flujo automatico con PlatformIO" in msg
     assert "Error tecnico final:" in msg
 
 
@@ -227,7 +226,6 @@ def test_upload_failure_reports_automatic_flow_and_technical_error() -> None:
     )
 
     assert "Upload failed" in msg
-    assert "Willy mantendra un flujo automatico con PlatformIO" in msg
     assert "Error tecnico final:" in msg
 
 
@@ -267,7 +265,7 @@ def test_sanitize_assistant_text_blocks_unsolicited_manual_platformio_steps() ->
 
     assert "platformio.ini" not in cleaned.lower()
     assert "carpeta lib" not in cleaned.lower()
-    assert "flujo automatico" in cleaned.lower()
+    assert "diagnóstico" in cleaned.lower() or "diagnostico" in cleaned.lower()
 
 
 def test_tool_scan_i2c_bus_reports_detected_addresses() -> None:
@@ -333,3 +331,98 @@ def test_tool_result_is_failure_heuristic() -> None:
     assert agent._tool_result_is_failure("✗ Upload failed: boom") is True
     assert agent._tool_result_is_failure("Error: missing project") is True
     assert agent._tool_result_is_failure("✓ Firmware uploaded successfully") is False
+
+
+def test_command_policy_lab_safe_blocks_unknown_command(monkeypatch) -> None:
+    monkeypatch.setattr("app.ai_agent.platform.system", lambda: "Linux")
+    agent = _agent()
+
+    ok, reason = agent._validate_command_policy("curl https://example.com")
+
+    assert ok is False
+    assert "not allowed" in reason
+
+
+def test_command_policy_standard_allows_unknown_but_blocks_dangerous(monkeypatch) -> None:
+    monkeypatch.setattr("app.ai_agent.platform.system", lambda: "Linux")
+    agent = AIAgent(
+        config={"default_board": "esp32", "security_profile": "standard"},
+        terminal_manager=DummyTM(),
+        on_message=lambda _r, _t: None,
+        on_confirm_request=lambda _title, _detail, callback: callback(True),
+        on_status=lambda _s: None,
+        arduino_manager=DummyArduinoManager(),
+    )
+
+    ok_unknown, _ = agent._validate_command_policy("curl https://example.com")
+    ok_danger, reason_danger = agent._validate_command_policy("rm -rf /")
+
+    assert ok_unknown is True
+    assert ok_danger is False
+    assert "blocked dangerous pattern" in reason_danger
+
+
+def test_command_policy_permissive_allows_any_command(monkeypatch) -> None:
+    monkeypatch.setattr("app.ai_agent.platform.system", lambda: "Windows")
+    agent = AIAgent(
+        config={"default_board": "esp32", "security_profile": "permissive"},
+        terminal_manager=DummyTM(),
+        on_message=lambda _r, _t: None,
+        on_confirm_request=lambda _title, _detail, callback: callback(True),
+        on_status=lambda _s: None,
+        arduino_manager=DummyArduinoManager(),
+    )
+
+    ok, reason = agent._validate_command_policy("format C:")
+
+    assert ok is True
+    assert reason == ""
+
+
+def test_role_policy_student_blocks_sensitive_tools() -> None:
+    agent = AIAgent(
+        config={"default_board": "esp32", "operation_role": "student"},
+        terminal_manager=DummyTM(),
+        on_message=lambda _r, _t: None,
+        on_confirm_request=lambda _title, _detail, callback: callback(True),
+        on_status=lambda _s: None,
+        arduino_manager=DummyArduinoManager(),
+    )
+
+    assert agent._is_tool_allowed_for_role("run_command") is False
+    assert agent._is_tool_allowed_for_role("write_file") is False
+    assert agent._is_tool_allowed_for_role("build_microcontroller") is True
+
+
+def test_role_policy_instructor_allows_run_command() -> None:
+    agent = AIAgent(
+        config={"default_board": "esp32", "operation_role": "instructor"},
+        terminal_manager=DummyTM(),
+        on_message=lambda _r, _t: None,
+        on_confirm_request=lambda _title, _detail, callback: callback(True),
+        on_status=lambda _s: None,
+        arduino_manager=DummyArduinoManager(),
+    )
+
+    assert agent._is_tool_allowed_for_role("run_command") is True
+    assert agent._is_tool_allowed_for_role("write_file") is True
+
+
+def test_dispatch_tool_blocks_by_role_policy() -> None:
+    agent = AIAgent(
+        config={"default_board": "esp32", "operation_role": "student"},
+        terminal_manager=DummyTM(),
+        on_message=lambda _r, _t: None,
+        on_confirm_request=lambda _title, _detail, callback: callback(True),
+        on_status=lambda _s: None,
+        arduino_manager=DummyArduinoManager(),
+    )
+
+    tc = SimpleNamespace(
+        function=SimpleNamespace(name="run_command", arguments='{"command":"echo test"}')
+    )
+
+    result = agent._dispatch_tool(tc)
+
+    assert "blocked by role policy" in result
+    assert "operation_role=student" in result
