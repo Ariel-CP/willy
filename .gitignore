@@ -5,3 +5,8 @@ __pycache__/
 sessions/
 .pio/
 outputs/**/.pio/
+logs/
+outputs/schematics/
+outputs/audit/
+willy_tool_errors.log
+.willy_build_history.json

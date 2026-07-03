@@ -19,15 +19,23 @@ class FileBrowser(ctk.CTkFrame):
         self,
         master,
         on_file_selected: Callable[[str], None],
+        on_open_folder: Callable[[], None] | None = None,
+        on_new_project: Callable[[], None] | None = None,
+        on_open_recent_projects: Callable[[], None] | None = None,
         initial_path: str = "~",
         **kwargs,
     ):
         super().__init__(master, **kwargs)
         self._on_file_selected = on_file_selected
+        self._on_open_folder = on_open_folder
+        self._on_new_project = on_new_project
+        self._on_open_recent_projects = on_open_recent_projects
         self._tree_style_name = "Willy.Treeview"
         self._v_scroll_style_name = "Willy.Tree.Vertical.TScrollbar"
         self._h_scroll_style_name = "Willy.Tree.Horizontal.TScrollbar"
-        self._tree_content_width = 320
+        self._tree_min_content_width = 180
+        self._tree_max_content_width = 300
+        self._tree_content_width = self._tree_min_content_width
         self._tree_text_font = tkfont.Font(family="Segoe UI", size=11)
         candidate = os.path.expanduser(initial_path)
         if os.path.isdir(candidate):
@@ -60,6 +68,39 @@ class FileBrowser(ctk.CTkFrame):
 
         ctk.CTkButton(
             header,
+            text=i18n.get("open_folder_btn"),
+            width=44,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=self._handle_open_folder,
+        ).grid(row=0, column=1, padx=(0, 4), pady=6)
+
+        ctk.CTkButton(
+            header,
+            text=i18n.get("new_project_btn"),
+            width=44,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            command=self._handle_new_project,
+        ).grid(row=0, column=2, padx=(0, 4), pady=6)
+
+        ctk.CTkButton(
+            header,
+            text=i18n.get("recent_projects_btn"),
+            width=58,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=self._handle_open_recent_projects,
+        ).grid(row=0, column=3, padx=(0, 4), pady=6)
+
+        ctk.CTkButton(
+            header,
             text="↑",
             width=28,
             height=24,
@@ -67,7 +108,7 @@ class FileBrowser(ctk.CTkFrame):
             fg_color=("gray70", "gray35"),
             hover_color=("gray60", "gray45"),
             command=self._go_up,
-        ).grid(row=0, column=1, padx=(0, 4), pady=6)
+        ).grid(row=0, column=4, padx=(0, 4), pady=6)
 
         ctk.CTkButton(
             header,
@@ -78,7 +119,7 @@ class FileBrowser(ctk.CTkFrame):
             fg_color=("gray70", "gray35"),
             hover_color=("gray60", "gray45"),
             command=lambda: self._populate(self._root_path),
-        ).grid(row=0, column=2, padx=(0, 6), pady=6)
+        ).grid(row=0, column=5, padx=(0, 6), pady=6)
 
         # Current path label
         self.path_label = ctk.CTkLabel(
@@ -236,6 +277,9 @@ class FileBrowser(ctk.CTkFrame):
         target = path if os.path.isdir(path) else os.path.dirname(path)
         self._populate(target)
 
+    def current_root_path(self) -> str:
+        return self._root_path
+
     # ------------------------------------------------------------------
     # Events
     # ------------------------------------------------------------------
@@ -251,6 +295,18 @@ class FileBrowser(ctk.CTkFrame):
         full_path = values[0]
         if os.path.isdir(full_path):
             self._populate_children(node_id, full_path)
+
+    def _handle_open_folder(self) -> None:
+        if callable(self._on_open_folder):
+            self._on_open_folder()
+
+    def _handle_new_project(self) -> None:
+        if callable(self._on_new_project):
+            self._on_new_project()
+
+    def _handle_open_recent_projects(self) -> None:
+        if callable(self._on_open_recent_projects):
+            self._on_open_recent_projects()
 
     def _on_double_click(self, _event=None) -> None:
         selected_item = self.tree.selection()
@@ -303,13 +359,16 @@ class FileBrowser(ctk.CTkFrame):
 
     def _reset_tree_width(self, root_text: str) -> None:
         root_width = self._tree_text_font.measure(root_text) + 40
-        self._tree_content_width = max(320, root_width)
+        self._tree_content_width = min(
+            self._tree_max_content_width,
+            max(self._tree_min_content_width, root_width),
+        )
         self.tree.column("#0", width=self._tree_content_width)
 
     def _grow_tree_width(self, text: str, depth: int) -> None:
         required = self._tree_text_font.measure(text) + 44 + (depth * 22)
         if required > self._tree_content_width:
-            self._tree_content_width = required
+            self._tree_content_width = min(required, self._tree_max_content_width)
             self.tree.column("#0", width=self._tree_content_width)
 
     def _selected_path(self) -> str | None:
