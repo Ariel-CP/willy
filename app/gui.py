@@ -6,6 +6,7 @@ Layout:  [FileBrowser (sidebar)] | [ChatPanel] | [TerminalPanel]
 import json
 import os
 import platform
+import re
 import socket
 import queue
 import threading
@@ -42,6 +43,106 @@ AUDIT_OUTPUT_DIR = os.path.join(
     "outputs",
     "audit",
 )
+
+PROJECT_PRESETS = {
+    "Arduino Uno": {
+        "board": "uno",
+        "platform": "atmelavr",
+        "framework": "arduino",
+    },
+    "ESP32 DevKit": {
+        "board": "esp32dev",
+        "platform": "espressif32",
+        "framework": "arduino",
+    },
+    "ESP8266 NodeMCU": {
+        "board": "nodemcuv2",
+        "platform": "espressif8266",
+        "framework": "arduino",
+    },
+    "Raspberry Pi Pico": {
+        "board": "rpipico",
+        "platform": "raspberrypi",
+        "framework": "arduino",
+    },
+}
+
+PROJECT_TEMPLATES = {
+    "Base Generica": {
+        "label": "Base Generica",
+        "code": (
+            "#include <Arduino.h>\n\n"
+            "// Punto de entrada de inicializacion.\n"
+            "void setup() {\n"
+            "  // TODO: configura pines, buses y perifericos\n"
+            "}\n\n"
+            "// Bucle principal del firmware.\n"
+            "void loop() {\n"
+            "  // TODO: logica principal no bloqueante\n"
+            "}\n"
+        ),
+    },
+    "Blink": {
+        "label": "Blink",
+        "code": (
+            "#include <Arduino.h>\n\n"
+            "void setup() {\n"
+            "  pinMode(LED_BUILTIN, OUTPUT);\n"
+            "}\n\n"
+            "void loop() {\n"
+            "  digitalWrite(LED_BUILTIN, HIGH);\n"
+            "  delay(500);\n"
+            "  digitalWrite(LED_BUILTIN, LOW);\n"
+            "  delay(500);\n"
+            "}\n"
+        ),
+    },
+    "Serial Monitor": {
+        "label": "Serial Monitor",
+        "code": (
+            "#include <Arduino.h>\n\n"
+            "void setup() {\n"
+            "  Serial.begin(115200);\n"
+            "  while (!Serial) { }\n"
+            "  Serial.println(\"Willy listo para monitoreo serial\");\n"
+            "}\n\n"
+            "void loop() {\n"
+            "  Serial.println(\"Heartbeat\");\n"
+            "  delay(1000);\n"
+            "}\n"
+        ),
+    },
+    "I2C Scanner": {
+        "label": "I2C Scanner",
+        "code": (
+            "#include <Arduino.h>\n"
+            "#include <Wire.h>\n\n"
+            "void setup() {\n"
+            "  Wire.begin();\n"
+            "  Serial.begin(115200);\n"
+            "  while (!Serial) { }\n"
+            "  Serial.println(\"I2C scan iniciado\");\n"
+            "}\n\n"
+            "void loop() {\n"
+            "  byte found = 0;\n"
+            "  for (byte address = 1; address < 127; address++) {\n"
+            "    Wire.beginTransmission(address);\n"
+            "    if (Wire.endTransmission() == 0) {\n"
+            "      Serial.print(\"Dispositivo en 0x\");\n"
+            "      if (address < 16) { Serial.print('0'); }\n"
+            "      Serial.println(address, HEX);\n"
+            "      found++;\n"
+            "    }\n"
+            "  }\n"
+            "  if (!found) {\n"
+            "    Serial.println(\"No se detectaron dispositivos I2C\");\n"
+            "  }\n"
+            "  Serial.println(\"---\");\n"
+            "  delay(3000);\n"
+            "}\n"
+        ),
+    },
+}
 
 
 def _is_configured_api_key(value: str) -> bool:
@@ -129,8 +230,15 @@ class WillyApp(ctk.CTk):
         self._active_project_path = ""
         self._active_project_info: dict = {}
         self._active_netlist_path = ""
+        self._project_code_selection: dict[str, str] = {}
+        self._project_view_snapshot: dict = {}
+        self._sidebar_width = int(self.config_data.get("sidebar_width", 220) or 220)
+        self._sidebar_width = max(180, min(360, self._sidebar_width))
+        self._sidebar_dragging = False
         self._project_poll_job = None
         self._last_iot_action_state = "idle"
+        self._last_iot_action_kind = ""
+        self._last_iot_action_ok: bool | None = None
         self._updating_project = False
         self._code_expand_window = None
         self._code_expand_text = None
@@ -155,8 +263,10 @@ class WillyApp(ctk.CTk):
 
     def _build_layout(self) -> None:
         self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=0, minsize=self._sidebar_width)
+        self.grid_columnconfigure(1, weight=0, minsize=6)
         self.grid_columnconfigure(2, weight=1)
+        self.grid_columnconfigure(3, weight=1)
 
         initial_dir = self.config_data.get("initial_directory", "~")
         self.session_logger = SessionLogger()
@@ -190,20 +300,36 @@ class WillyApp(ctk.CTk):
         self.file_browser = FileBrowser(
             self,
             on_file_selected=self._on_file_selected,
+            on_open_folder=self._choose_workspace_folder,
+            on_new_project=self._open_new_project_dialog,
+            on_open_recent_projects=self._open_recent_projects_dialog,
             initial_path=initial_dir,
-            width=200,
+            width=self._sidebar_width,
             fg_color=("gray90", "gray12"),
         )
+        self.file_browser.grid_propagate(False)
         self.file_browser.grid(row=0, column=0, sticky="nsew")
+
+        self.sidebar_splitter = ctk.CTkFrame(
+            self,
+            width=6,
+            corner_radius=0,
+            fg_color=("gray78", "gray24"),
+        )
+        self.sidebar_splitter.grid(row=0, column=1, sticky="ns")
+        self.sidebar_splitter.configure(cursor="sb_h_double_arrow")
+        self.sidebar_splitter.bind("<ButtonPress-1>", self._on_sidebar_drag_start)
+        self.sidebar_splitter.bind("<B1-Motion>", self._on_sidebar_drag_motion)
+        self.sidebar_splitter.bind("<ButtonRelease-1>", self._on_sidebar_drag_end)
 
         self.chat_panel = ChatPanel(
             self,
             fg_color=("gray95", "#0a0f14"),
         )
-        self.chat_panel.grid(row=0, column=1, sticky="nsew", padx=(1, 1))
+        self.chat_panel.grid(row=0, column=2, sticky="nsew", padx=(1, 1))
 
         self.right_panel = ctk.CTkFrame(self, fg_color=("gray92", "#0a0f14"))
-        self.right_panel.grid(row=0, column=2, sticky="nsew")
+        self.right_panel.grid(row=0, column=3, sticky="nsew")
         self.right_panel.grid_columnconfigure(0, weight=1)
         self.right_panel.grid_rowconfigure(0, weight=1)
 
@@ -219,7 +345,7 @@ class WillyApp(ctk.CTk):
         self._build_workspace_tabs(self.right_tabview)
 
         status_bar = ctk.CTkFrame(self, height=22, fg_color=("gray80", "gray18"))
-        status_bar.grid(row=1, column=0, columnspan=3, sticky="ew")
+        status_bar.grid(row=1, column=0, columnspan=4, sticky="ew")
         status_bar.grid_columnconfigure(0, weight=1)
 
         self.status_bar_label = ctk.CTkLabel(
@@ -268,7 +394,7 @@ class WillyApp(ctk.CTk):
 
     def _build_workspace_tabs(self, tabview) -> None:
         terminal_tab = tabview.add("Terminal + Consola")
-        flow_tab = tabview.add("Flujo del Sistema")
+        flow_tab = tabview.add("Flujo de Firmware")
         wiring_tab = tabview.add("Conexion Electrica")
         code_tab = tabview.add("Codigo del Programa")
 
@@ -494,7 +620,7 @@ class WillyApp(ctk.CTk):
 
         ctk.CTkLabel(
             header,
-            text="Diagrama de Flujo del Sistema",
+            text="Diagrama de Compilacion y Carga",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=("gray20", "#7ec8e3"),
             anchor="w",
@@ -692,6 +818,18 @@ class WillyApp(ctk.CTk):
         )
         self.expand_code_btn.pack(side="left")
 
+        self.project_deps_btn = ctk.CTkButton(
+            code_actions,
+            text=i18n.get("project_deps_btn"),
+            width=90,
+            height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=self._open_project_dependencies_dialog,
+        )
+        self.project_deps_btn.pack(side="left", padx=(4, 0))
+
         code_card = ctk.CTkFrame(parent, fg_color=("gray88", "#111821"))
         code_card.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
         code_card.grid_rowconfigure(0, weight=1)
@@ -717,33 +855,106 @@ class WillyApp(ctk.CTk):
         if not hasattr(self, "flow_canvas") or self.flow_canvas is None:
             return
 
-        try:
-            cwd = self.terminal_manager.get_cwd()
-        except Exception:
-            cwd = os.getcwd()
-
-        os_name = platform.system() or "Unknown"
-        model = self.config_data.get("model", "gpt-5.3-codex")
-        board = self.config_data.get("default_board", "uno")
-        port = self.config_data.get("default_port", "COM?")
-        detected = len(self._detected_devices) if isinstance(self._detected_devices, list) else 0
-        project_name = os.path.basename(self._active_project_path) if self._active_project_path else "sin proyecto"
-        main_code = os.path.join(self._active_project_path, "src", "main.cpp") if self._active_project_path else ""
-        has_code = bool(main_code and os.path.isfile(main_code))
-        has_diagram = bool(self._latest_schematic_path and os.path.isfile(self._latest_schematic_path))
-        has_netlist = bool(self._active_netlist_path and os.path.isfile(self._active_netlist_path))
-        envs = self._active_project_info.get("environments", []) if isinstance(self._active_project_info, dict) else []
-        env_label = ", ".join([str(e) for e in envs[:2]]) if envs else "(sin env)"
-
         canvas = self.flow_canvas
         canvas.delete("all")
 
-        width = max(760, canvas.winfo_width())
+        width = max(860, canvas.winfo_width())
         height = max(520, canvas.winfo_height())
+
+        project_path = self._active_project_path or ""
+        project_name = os.path.basename(project_path) if project_path else "sin proyecto"
+        source_path = self._resolve_project_code_path(project_path) if project_path else ""
+        has_source = bool(source_path and os.path.isfile(source_path))
+
+        ini_path = os.path.join(project_path, "platformio.ini") if project_path else ""
+        has_ini = bool(ini_path and os.path.isfile(ini_path))
+
+        info = self._active_project_info if isinstance(self._active_project_info, dict) else {}
+        envs = [str(e).strip() for e in info.get("environments", []) if str(e).strip()]
+        default_env = str(info.get("default_env") or "").strip()
+        env_label = default_env or (envs[0] if envs else "sin env")
+
+        selected_device = self.device_picker_var.get() if hasattr(self, "device_picker_var") else ""
+        board_hint = ""
+        if selected_device and selected_device != "Sin dispositivos":
+            board_hint = selected_device.split(" - ", 1)[0].strip()
+        if not board_hint:
+            board_hint = str(self.config_data.get("default_board", "uno"))
+
+        detected = len(self._detected_devices) if isinstance(self._detected_devices, list) else 0
+        port = self._selected_or_default_port()
+
+        firmware_path = self._find_latest_firmware_artifact(project_path, env_label)
+        has_firmware = bool(firmware_path)
+
+        action_state = self._last_iot_action_state
+        action_kind = (self._last_iot_action_kind or "").strip().lower()
+        action_ok = self._last_iot_action_ok
+
+        compile_state = "blocked"
+        if action_state == "compiling":
+            compile_state = "active"
+        elif action_kind == "compile" and action_ok is True:
+            compile_state = "ok"
+        elif action_kind == "compile" and action_ok is False:
+            compile_state = "error"
+        elif has_ini and has_source:
+            compile_state = "ready"
+
+        upload_state = "blocked"
+        if action_state == "uploading":
+            upload_state = "active"
+        elif action_kind == "upload" and action_ok is True:
+            upload_state = "ok"
+        elif action_kind == "upload" and action_ok is False:
+            upload_state = "error"
+        elif has_ini and has_firmware and detected > 0:
+            upload_state = "ready"
+
+        source_state = "ready" if has_source else "blocked"
+        config_state = "ready" if has_ini else "blocked"
+        firmware_state = "ready" if has_firmware else ("active" if action_state == "compiling" else "blocked")
+        board_state = "ready" if detected > 0 else "blocked"
+
+        palette = {
+            "blocked": "#334155",
+            "ready": "#1e40af",
+            "active": "#b45309",
+            "ok": "#15803d",
+            "error": "#b91c1c",
+        }
+
+        def node_color(state: str) -> str:
+            return palette.get(state, palette["blocked"])
+
+        def state_label(state: str) -> str:
+            labels = {
+                "blocked": "pendiente",
+                "ready": "listo",
+                "active": "ejecutando",
+                "ok": "ok",
+                "error": "error",
+            }
+            return labels.get(state, state)
 
         title_color = "#7ec8e3"
         text_color = "#d1d5db"
         edge_color = "#60a5fa"
+
+        logic_view = self._build_firmware_logic_view(source_path) if has_source else {
+            "steps": [
+                ("Inicio", "Selecciona un archivo fuente del proyecto"),
+                ("setup()", "No disponible"),
+                ("loop()", "No disponible"),
+            ],
+            "loop_back_index": None,
+            "pseudocode": [
+                "INICIO",
+                "1. Abrir un archivo fuente valido (ej: src/main.cpp)",
+                "2. Definir setup() y loop()",
+                "3. Compilar y ejecutar en placa",
+            ],
+        }
 
         canvas.create_text(
             14,
@@ -751,7 +962,7 @@ class WillyApp(ctk.CTk):
             anchor="w",
             fill=title_color,
             font=("Segoe UI", 12, "bold"),
-            text="Flujo General del Sistema",
+            text="Flujo Logico del Firmware",
         )
         canvas.create_text(
             14,
@@ -759,10 +970,7 @@ class WillyApp(ctk.CTk):
             anchor="w",
             fill="#9ca3af",
             font=("Segoe UI", 9),
-            text=(
-                f"OS: {os_name} | Modelo: {model} | board: {board} | port: {port} | detectados: {detected} "
-                f"| proyecto: {project_name}"
-            ),
+            text=f"Proyecto: {project_name} | Env: {env_label} | Board: {board_hint} | Puerto: {port}",
         )
         canvas.create_text(
             14,
@@ -770,66 +978,135 @@ class WillyApp(ctk.CTk):
             anchor="w",
             fill="#6b7280",
             font=("Segoe UI", 8),
-            text=f"CWD: {cwd} | env: {env_label}",
+            text=(
+                f"Codigo: {self._truncate_flow_text(os.path.basename(source_path) if has_source else 'sin fuente activa', 58)} "
+                f"| IoT: {self._last_iot_action_state}"
+            ),
         )
 
-        node_w = 190
-        node_h = 54
-        cx = int(width * 0.30)
-        rx = int(width * 0.70)
-        y0 = 90
-        gap = 86
+        left_x = 14
+        top_y = 84
+        left_w = max(320, int(width * 0.52))
+        node_w = left_w - 28
+        node_h = 52
+        node_gap = 10
 
-        user_box = (cx, y0)
-        chat_box = (cx, y0 + gap)
-        agent_box = (cx, y0 + (gap * 2))
-        logger_box = (cx, y0 + (gap * 3))
+        flow_steps = logic_view.get("steps", [])
+        if not flow_steps:
+            flow_steps = [("Inicio", "Sin pasos detectados")]
 
-        tm_box = (rx, y0 + gap)
-        arduino_box = (rx, y0 + (gap * 2))
-        diag_box = (rx, y0 + (gap * 3))
+        max_nodes_height = (height - 280)
+        total_nodes_height = len(flow_steps) * node_h + max(0, len(flow_steps) - 1) * node_gap
+        if total_nodes_height > max_nodes_height and len(flow_steps) > 1:
+            node_h = max(42, int((max_nodes_height - ((len(flow_steps) - 1) * node_gap)) / len(flow_steps)))
 
-        self._draw_flow_node(*user_box, node_w, node_h, "Usuario", "Solicita acciones", "#1f2937")
-        self._draw_flow_node(*chat_box, node_w, node_h, "ChatPanel / UI", "Mensajes y estado", "#1e3a5f")
-        self._draw_flow_node(*agent_box, node_w, node_h, "AIAgent", "Planifica y llama tools", "#0f766e")
-        self._draw_flow_node(*logger_box, node_w, node_h, "SessionLogger", "Auditoria y sesiones", "#3f3f46")
-
-        self._draw_flow_node(*tm_box, node_w, node_h, "TerminalManager", "Comandos del sistema", "#1d4ed8")
-        state_colors = {
-            "idle": "#166534",
-            "compiling": "#1d4ed8",
-            "uploading": "#d97706",
-            "success": "#15803d",
-            "error": "#991b1b",
-        }
-        run_color = state_colors.get(self._last_iot_action_state, state_colors["idle"])
-        self._draw_flow_node(
-            *arduino_box,
-            node_w,
-            node_h,
-            "ArduinoManager",
-            f"Build / Upload / I2C ({self._last_iot_action_state})",
-            run_color,
+        canvas.create_rectangle(
+            left_x,
+            top_y,
+            left_x + left_w,
+            height - 190,
+            outline="#334155",
+            fill="#0b1220",
+            width=1,
         )
-        self._draw_flow_node(
-            *diag_box,
-            node_w,
-            node_h,
-            "IoTDiagramManager",
-            f"Esquema={'si' if has_diagram else 'no'} | Netlist={'si' if has_netlist else 'no'}",
-            "#7c2d12",
+        canvas.create_text(
+            left_x + 10,
+            top_y + 12,
+            anchor="w",
+            fill=title_color,
+            font=("Segoe UI", 10, "bold"),
+            text="Diagrama de Flujo del Codigo",
         )
 
-        self._draw_flow_arrow(cx, y0 + node_h, cx, y0 + gap)
-        self._draw_flow_arrow(cx, y0 + gap + node_h, cx, y0 + (gap * 2))
-        self._draw_flow_arrow(cx, y0 + (gap * 2) + node_h, cx, y0 + (gap * 3))
+        node_x = left_x + 14
+        node_y = top_y + 28
+        first_loop_index = logic_view.get("loop_back_index")
+        node_positions: list[tuple[int, int]] = []
 
-        self._draw_flow_arrow(cx + node_w, y0 + (gap * 2) + int(node_h / 2), rx, y0 + gap + int(node_h / 2))
-        self._draw_flow_arrow(cx + node_w, y0 + (gap * 2) + int(node_h / 2), rx, y0 + (gap * 2) + int(node_h / 2))
-        self._draw_flow_arrow(cx + node_w, y0 + (gap * 2) + int(node_h / 2), rx, y0 + (gap * 3) + int(node_h / 2))
+        for idx, (title, subtitle) in enumerate(flow_steps):
+            self._draw_flow_node(
+                node_x,
+                node_y,
+                node_w,
+                node_h,
+                title,
+                self._truncate_flow_text(subtitle, 80),
+                "#1f2937",
+            )
+            node_positions.append((node_x, node_y))
+
+            if idx < len(flow_steps) - 1:
+                self._draw_flow_arrow(
+                    node_x + int(node_w / 2),
+                    node_y + node_h,
+                    node_x + int(node_w / 2),
+                    node_y + node_h + node_gap,
+                )
+            node_y += node_h + node_gap
+
+        if isinstance(first_loop_index, int) and 0 <= first_loop_index < len(node_positions) and len(node_positions) > 1:
+            last_x, last_y = node_positions[-1]
+            target_x, target_y = node_positions[first_loop_index]
+            side_x = node_x + node_w + 20
+            canvas.create_line(
+                last_x + node_w,
+                last_y + int(node_h / 2),
+                side_x,
+                last_y + int(node_h / 2),
+                side_x,
+                target_y + int(node_h / 2),
+                target_x + node_w,
+                target_y + int(node_h / 2),
+                fill="#60a5fa",
+                width=2,
+                arrow=tk.LAST,
+                smooth=True,
+            )
+            canvas.create_text(
+                side_x - 4,
+                target_y - 8,
+                anchor="e",
+                fill="#93c5fd",
+                font=("Segoe UI", 8, "bold"),
+                text="loop",
+            )
+
+        pseudo_x1 = left_x + left_w + 10
+        pseudo_x2 = width - 14
+        pseudo_y1 = top_y
+        pseudo_y2 = height - 190
+        canvas.create_rectangle(
+            pseudo_x1,
+            pseudo_y1,
+            pseudo_x2,
+            pseudo_y2,
+            outline="#334155",
+            fill="#0b1220",
+            width=1,
+        )
+        canvas.create_text(
+            pseudo_x1 + 10,
+            pseudo_y1 + 12,
+            anchor="w",
+            fill=title_color,
+            font=("Segoe UI", 10, "bold"),
+            text="Pseudocodigo (Pro)",
+        )
+
+        pseudocode_text = "\n".join(logic_view.get("pseudocode", []))
+        canvas.create_text(
+            pseudo_x1 + 10,
+            pseudo_y1 + 34,
+            anchor="nw",
+            fill="#cbd5e1",
+            font=("Consolas", 9),
+            justify="left",
+            width=max(180, (pseudo_x2 - pseudo_x1 - 20)),
+            text=pseudocode_text,
+        )
 
         card_x1 = 14
-        card_y1 = height - 130
+        card_y1 = height - 180
         card_x2 = width - 14
         card_y2 = height - 14
         canvas.create_rectangle(card_x1, card_y1, card_x2, card_y2, outline="#334155", fill="#0b1220", width=1)
@@ -839,36 +1116,262 @@ class WillyApp(ctk.CTk):
             anchor="w",
             fill=title_color,
             font=("Segoe UI", 10, "bold"),
-            text="Flujo IoT de Campo",
+            text="Estado de Compilacion y Carga",
         )
-        steps = "1) Escanear dispositivo   2) Conectar   3) Compilar   4) Grabar   5) Monitor serial   6) I2C scan"
+
+        source_label = os.path.basename(source_path) if has_source else "(no detectado)"
+        firmware_label = os.path.basename(firmware_path) if has_firmware else "(no generado)"
+        lines = [
+            f"Proyecto activo: {project_name}",
+            f"Fuente: {self._truncate_flow_text(source_label, 52)}",
+            f"Config: {'ok' if has_ini else 'pendiente'} | Env: {env_label}",
+            f"Firmware: {self._truncate_flow_text(firmware_label, 50)}",
+            f"Upload: {state_label(upload_state)} | Puerto: {port}",
+            f"Placa detectada: {'si' if detected > 0 else 'no'}",
+        ]
+
+        y_line = card_y1 + 36
+        for line in lines:
+            canvas.create_text(
+                card_x1 + 10,
+                y_line,
+                anchor="w",
+                fill=text_color,
+                font=("Segoe UI", 9),
+                text=line,
+            )
+            y_line += 18
+
         canvas.create_text(
             card_x1 + 10,
-            card_y1 + 36,
+            card_y2 - 16,
             anchor="w",
-            fill=text_color,
-            font=("Segoe UI", 9),
-            text=steps,
+            fill=edge_color,
+            font=("Segoe UI", 8),
+            text="Pipeline operativo: Codigo -> Compilar -> Firmware -> Upload",
         )
-        status_label = "Conectado" if detected > 0 else "Sin dispositivos detectados"
-        status_color = "#22c55e" if detected > 0 else edge_color
-        canvas.create_text(
-            card_x1 + 10,
-            card_y1 + 58,
-            anchor="w",
-            fill=status_color,
-            font=("Segoe UI", 9, "bold"),
-            text=f"Estado actual: {status_label}",
+
+    def _find_latest_firmware_artifact(self, project_path: str, env_hint: str = "") -> str:
+        if not project_path:
+            return ""
+
+        build_root = os.path.join(project_path, ".pio", "build")
+        if not os.path.isdir(build_root):
+            return ""
+
+        preferred_env = (env_hint or "").strip()
+        candidate_dirs: list[str] = []
+        if preferred_env:
+            env_path = os.path.join(build_root, preferred_env)
+            if os.path.isdir(env_path):
+                candidate_dirs.append(env_path)
+
+        try:
+            for name in os.listdir(build_root):
+                path = os.path.join(build_root, name)
+                if os.path.isdir(path) and path not in candidate_dirs:
+                    candidate_dirs.append(path)
+        except Exception:
+            return ""
+
+        exts = (".bin", ".hex", ".elf", ".uf2")
+        newest_path = ""
+        newest_mtime = 0.0
+
+        for folder in candidate_dirs:
+            try:
+                for name in os.listdir(folder):
+                    artifact = os.path.join(folder, name)
+                    if not os.path.isfile(artifact):
+                        continue
+                    if not name.lower().endswith(exts):
+                        continue
+                    mtime = os.path.getmtime(artifact)
+                    if mtime > newest_mtime:
+                        newest_mtime = mtime
+                        newest_path = artifact
+            except Exception:
+                continue
+
+        return newest_path
+
+    def _truncate_flow_text(self, text: str, max_chars: int = 24) -> str:
+        value = (text or "").strip()
+        if len(value) <= max_chars:
+            return value
+        return value[: max_chars - 3].rstrip() + "..."
+
+    def _build_firmware_logic_view(self, source_path: str) -> dict:
+        try:
+            with open(source_path, "r", encoding="utf-8", errors="replace") as fh:
+                source = fh.read()
+        except Exception:
+            source = ""
+
+        setup_body = self._extract_cpp_function_body(source, "setup")
+        loop_body = self._extract_cpp_function_body(source, "loop")
+
+        blink = re.search(
+            r"digitalWrite\s*\(\s*([A-Za-z0-9_]+)\s*,\s*HIGH\s*\)\s*;\s*"
+            r"delay\s*\(\s*(\d+)\s*\)\s*;\s*"
+            r"digitalWrite\s*\(\s*\1\s*,\s*LOW\s*\)\s*;\s*"
+            r"delay\s*\(\s*(\d+)\s*\)\s*;",
+            loop_body,
+            re.DOTALL,
         )
-        code_label = os.path.basename(main_code) if has_code else "sin src/main.cpp"
-        canvas.create_text(
-            card_x1 + 10,
-            card_y1 + 78,
-            anchor="w",
-            fill="#93c5fd",
-            font=("Segoe UI", 9),
-            text=f"Codigo activo: {code_label}",
-        )
+
+        if blink:
+            led_pin = blink.group(1)
+            on_ms = blink.group(2)
+            off_ms = blink.group(3)
+            setup_pin_mode = re.search(
+                r"pinMode\s*\(\s*([A-Za-z0-9_]+)\s*,\s*(OUTPUT|INPUT|INPUT_PULLUP)\s*\)",
+                setup_body,
+            )
+            setup_desc = "Configurar hardware inicial"
+            if setup_pin_mode:
+                setup_desc = f"pinMode({setup_pin_mode.group(1)}, {setup_pin_mode.group(2)})"
+
+            return {
+                "steps": [
+                    ("Inicio", "Boot del firmware y runtime Arduino"),
+                    ("setup()", setup_desc),
+                    ("Entrar loop()", "Bucle principal infinito"),
+                    ("Ciclo ON", f"digitalWrite({led_pin}, HIGH) + delay({on_ms} ms)"),
+                    ("Ciclo OFF", f"digitalWrite({led_pin}, LOW) + delay({off_ms} ms)"),
+                ],
+                "loop_back_index": 3,
+                "pseudocode": [
+                    f"CONST T_ON_MS  = {on_ms}",
+                    f"CONST T_OFF_MS = {off_ms}",
+                    "",
+                    "PROCEDURE setup():",
+                    f"  pinMode({led_pin}, OUTPUT)",
+                    "",
+                    "PROCEDURE loop():",
+                    "  WHILE true:",
+                    f"    digitalWrite({led_pin}, HIGH)",
+                    "    delay(T_ON_MS)",
+                    f"    digitalWrite({led_pin}, LOW)",
+                    "    delay(T_OFF_MS)",
+                ],
+            }
+
+        setup_actions = self._extract_cpp_actions(setup_body)
+        loop_actions = self._extract_cpp_actions(loop_body)
+
+        setup_desc = "; ".join(setup_actions[:2]) if setup_actions else "Inicializacion de hardware"
+        loop_desc = "; ".join(loop_actions[:2]) if loop_actions else "Ejecucion ciclica"
+        extra_loop = []
+        if len(loop_actions) > 2:
+            extra_loop.append(("Loop extra", self._truncate_flow_text("; ".join(loop_actions[2:4]), 80)))
+
+        pseudocode_lines = [
+            "PROCEDURE setup():",
+            f"  {setup_desc}",
+            "",
+            "PROCEDURE loop():",
+            f"  {loop_desc}",
+            "  REPEAT FOREVER",
+        ]
+        if len(loop_actions) > 2:
+            for action in loop_actions[2:4]:
+                pseudocode_lines.append(f"  {action}")
+
+        steps = [
+            ("Inicio", "Cargar firmware en memoria"),
+            ("setup()", setup_desc),
+            ("Entrar loop()", "Bucle principal"),
+            ("Loop core", loop_desc),
+        ] + extra_loop
+
+        return {
+            "steps": steps,
+            "loop_back_index": 3,
+            "pseudocode": pseudocode_lines,
+        }
+
+    def _extract_cpp_function_body(self, source: str, function_name: str) -> str:
+        if not source:
+            return ""
+        start = re.search(rf"\b{function_name}\s*\([^)]*\)\s*\{{", source)
+        if not start:
+            return ""
+        i = start.end()
+        depth = 1
+        while i < len(source):
+            ch = source[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start.end():i]
+            i += 1
+        return ""
+
+    def _extract_cpp_actions(self, body: str) -> list[str]:
+        if not body:
+            return []
+
+        actions: list[str] = []
+        statements = [part.strip() for part in body.split(";") if part.strip()]
+        for stmt in statements:
+            line = re.sub(r"//.*", "", stmt).strip()
+            if not line:
+                continue
+
+            pin_mode = re.search(
+                r"pinMode\s*\(\s*([^,]+)\s*,\s*([A-Za-z0-9_]+)\s*\)",
+                line,
+            )
+            if pin_mode:
+                actions.append(f"pinMode({pin_mode.group(1).strip()}, {pin_mode.group(2).strip()})")
+                continue
+
+            dig_write = re.search(
+                r"digitalWrite\s*\(\s*([^,]+)\s*,\s*([A-Za-z0-9_]+)\s*\)",
+                line,
+            )
+            if dig_write:
+                actions.append(
+                    f"digitalWrite({dig_write.group(1).strip()}, {dig_write.group(2).strip()})"
+                )
+                continue
+
+            delay_call = re.search(r"delay\s*\(\s*(\d+)\s*\)", line)
+            if delay_call:
+                actions.append(f"delay({delay_call.group(1)} ms)")
+                continue
+
+            analog_write = re.search(
+                r"analogWrite\s*\(\s*([^,]+)\s*,\s*([^\)]+)\)",
+                line,
+            )
+            if analog_write:
+                actions.append(
+                    f"analogWrite({analog_write.group(1).strip()}, {analog_write.group(2).strip()})"
+                )
+                continue
+
+            serial_print = re.search(r"Serial\.(print|println)\s*\((.*)\)", line)
+            if serial_print:
+                actions.append(f"Serial.{serial_print.group(1)}(...)" )
+                continue
+
+            if line.startswith("if"):
+                actions.append("if (...) { ... }")
+                continue
+            if line.startswith("for"):
+                actions.append("for (...) { ... }")
+                continue
+            if line.startswith("while"):
+                actions.append("while (...) { ... }")
+                continue
+
+            actions.append(self._truncate_flow_text(line, 46))
+
+        return actions[:6]
 
     def _draw_flow_node(self, x: int, y: int, w: int, h: int, title: str, subtitle: str, fill: str) -> None:
         if not hasattr(self, "flow_canvas") or self.flow_canvas is None:
@@ -885,10 +1388,12 @@ class WillyApp(ctk.CTk):
         )
         canvas.create_text(
             x + 10,
-            y + 36,
+            y + 34,
             anchor="w",
             fill="#cbd5e1",
             font=("Segoe UI", 9),
+            width=w - 20,
+            justify="left",
             text=subtitle,
         )
 
@@ -923,12 +1428,29 @@ class WillyApp(ctk.CTk):
             on_schematic_generated=self._on_schematic_generated,
         )
 
-        def _logged_send(text: str) -> None:
+        try:
+            self.ai_agent.set_active_project_context(
+                self._active_project_path,
+                self._active_project_info,
+            )
+        except Exception:
+            pass
+
+        def _logged_send(text: str, mode: str = "agent") -> None:
             self.session_logger.log_message("user", text)
             # Reacción: pensando cuando el usuario escribe
             if hasattr(self, "clippy") and self.clippy is not None:
                 self.clippy.set_expression("thinking")
-            self.ai_agent.send(text)
+            try:
+                self.ai_agent.send(text, mode=mode)
+            except Exception as exc:
+                self.session_logger.log_error(
+                    "chat_send",
+                    str(exc),
+                    context={"mode": mode, "source": "_logged_send"},
+                )
+                self._on_status("Error enviando mensaje al agente")
+                self.chat_panel.add_message("error", "No se pudo enviar el mensaje al agente.")
 
         self.chat_panel.set_send_callback(_logged_send)
 
@@ -995,20 +1517,27 @@ class WillyApp(ctk.CTk):
         self.session_logger.log_message(role, text)
         if role == "error":
             self.session_logger.log_error("ai_agent", text)
-        if not hasattr(self, "clippy") or self.clippy is None:
-            return
-        # Reacciones suaves para un asistente amigable orientado a adultos mayores.
-        if role == "assistant":
-            if "Web results for:" in text or "Source URL:" in text:
-                self.clippy.set_expression("surprised")
-            elif "¡Hola" in text or "Hello" in text:
-                self.clippy.set_expression("happy")
+        try:
+            if not hasattr(self, "clippy") or self.clippy is None:
+                return
+            # Reacciones suaves para un asistente amigable orientado a adultos mayores.
+            if role == "assistant":
+                if "Web results for:" in text or "Source URL:" in text:
+                    self.clippy.set_expression("surprised")
+                elif "¡Hola" in text or "Hello" in text:
+                    self.clippy.set_expression("happy")
+                else:
+                    self.clippy.set_expression("smile")
+            elif role == "error":
+                self.clippy.set_expression("neutral")
             else:
                 self.clippy.set_expression("smile")
-        elif role == "error":
-            self.clippy.set_expression("neutral")
-        else:
-            self.clippy.set_expression("smile")
+        except Exception as exc:
+            self.session_logger.log_error(
+                "chat_ui",
+                str(exc),
+                context={"role": role, "source": "_on_ai_message"},
+            )
 
     def _on_confirm_request(self, title: str, detail: str, callback) -> None:
         self.chat_panel.show_confirm_dialog(title, detail, callback)
@@ -1114,8 +1643,7 @@ class WillyApp(ctk.CTk):
         self._current_code_path = path
         self.chat_panel.add_message("system", i18n.get("file_selected", path=path))
         self._update_code_preview(path)
-        self._update_active_project_if_changed()
-        self._refresh_flow_diagram_text()
+        self._refresh_project_views_from_path(path, False)
         self.ai_agent.send(i18n.get("file_send_msg", path=path))
 
     def _on_schematic_generated(self, svg_path: str, bom_path: str) -> None:
@@ -1123,30 +1651,27 @@ class WillyApp(ctk.CTk):
         self.after(0, self._apply_generated_schematic, svg_path, bom_path)
 
     def _apply_generated_schematic(self, svg_path: str, bom_path: str) -> None:
-        self._latest_schematic_path = svg_path or ""
-        self._latest_bom_path = bom_path or ""
+        net_path = ""
         if svg_path:
             base = os.path.splitext(svg_path)[0]
             net_candidate = base + ".net"
             if os.path.isfile(net_candidate):
-                self._active_netlist_path = net_candidate
+                net_path = net_candidate
 
-        if hasattr(self, "diagram_status_label"):
-            if svg_path and os.path.isfile(svg_path):
-                self.diagram_status_label.configure(text=f"Diagrama: {os.path.basename(svg_path)}")
-                self.diagram_open_btn.configure(state="normal")
-            else:
-                self.diagram_status_label.configure(text="Diagrama: sin generar en esta sesión")
-                self.diagram_open_btn.configure(state="disabled")
+        if self._active_project_path:
+            self._store_project_artifacts(
+                self._active_project_path,
+                svg_path=svg_path,
+                bom_path=bom_path,
+                net_path=net_path,
+            )
 
-        self._update_schematic_preview(svg_path)
-        self._update_wiring_summary()
-        self._refresh_flow_diagram_text()
+        self._refresh_project_views(force_code_refresh=False)
 
     def _on_ai_file_written(self, path: str, content: str) -> None:
         # Called from agent worker thread; marshal to UI thread.
         self.after(0, self._update_code_preview_from_content, path, content)
-        self.after(0, self._update_active_project_if_changed)
+        self.after(0, self._refresh_project_views_from_path, path, False)
 
     def _update_code_preview_from_content(self, path: str, content: str) -> None:
         self._current_code_path = path
@@ -1165,6 +1690,11 @@ class WillyApp(ctk.CTk):
             self._code_expand_text.delete("0.0", "end")
             self._code_expand_text.insert("0.0", preview)
             self._code_expand_text.configure(state="disabled")
+
+        if self._active_project_path and self._path_belongs_to_project(path, self._active_project_path):
+            self._project_code_selection[self._active_project_path] = path
+
+        self._refresh_flow_diagram_text()
 
     def _set_device_indicator(self, connected: bool) -> None:
         if not hasattr(self, "device_indicator"):
@@ -1238,11 +1768,27 @@ class WillyApp(ctk.CTk):
         self._active_project_path = project_path or ""
         self._active_project_info = project_info or {}
 
-        if self._active_project_path:
-            self._load_code_for_project(self._active_project_path)
+        if hasattr(self, "ai_agent") and self.ai_agent is not None:
+            try:
+                self.ai_agent.set_active_project_context(
+                    self._active_project_path,
+                    self._active_project_info,
+                )
+            except Exception:
+                pass
 
-        self._refresh_latest_schematic()
-        self._refresh_flow_diagram_text()
+        if self._active_project_path:
+            self._remember_recent_project(self._active_project_path)
+        else:
+            self._latest_schematic_path = ""
+            self._latest_bom_path = ""
+            self._active_netlist_path = ""
+
+        self._refresh_project_views(
+            project_path=self._active_project_path,
+            project_info=self._active_project_info,
+            force_code_refresh=True,
+        )
 
         self.session_logger.log_event(
             "project_activated",
@@ -1254,22 +1800,21 @@ class WillyApp(ctk.CTk):
             },
         )
 
-    def _load_code_for_project(self, project_path: str) -> None:
-        main_cpp = os.path.join(project_path, "src", "main.cpp")
-        if os.path.isfile(main_cpp):
-            self._update_code_preview(main_cpp)
-            return
+        if self._active_project_path and hasattr(self, "chat_panel"):
+            agents_path = os.path.join(self._active_project_path, ".willy", "AGENTS.md")
+            if os.path.isfile(agents_path):
+                self.chat_panel.add_message(
+                    "system",
+                    i18n.get("project_context_loaded", path=agents_path),
+                )
 
-        preview = (
-            f"Proyecto activo: {project_path}\n\n"
-            "No se encontró src/main.cpp en este proyecto.\n"
-            "Selecciona un archivo desde el explorador para ver su contenido."
-        )
-        if hasattr(self, "code_preview"):
-            self.code_preview.configure(state="normal")
-            self.code_preview.delete("0.0", "end")
-            self.code_preview.insert("0.0", preview)
-            self.code_preview.configure(state="disabled")
+    def _load_code_for_project(self, project_path: str) -> None:
+        code_path = self._resolve_project_code_path(project_path)
+        if code_path and os.path.isfile(code_path):
+            self._project_code_selection[project_path] = code_path
+            self._update_code_preview(code_path)
+            return
+        self._show_project_code_placeholder(project_path)
 
     def _schedule_next_project_poll(self) -> None:
         if self._project_poll_job is not None:
@@ -1344,6 +1889,1008 @@ class WillyApp(ctk.CTk):
 
         return envs[0]
 
+    def _save_config(self) -> None:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as config_file:
+            json.dump(self.config_data, config_file, indent=4)
+
+    def _normalized_recent_projects(self) -> list[dict]:
+        raw_items = self.config_data.get("recent_projects", [])
+        normalized: list[dict] = []
+        seen_paths: set[str] = set()
+
+        if not isinstance(raw_items, list):
+            return normalized
+
+        for item in raw_items:
+            if isinstance(item, str):
+                path = item
+                label = os.path.basename(path) or path
+                last_opened = ""
+                favorite = False
+            elif isinstance(item, dict):
+                path = str(item.get("path", "")).strip()
+                label = str(item.get("label", "")).strip() or (os.path.basename(path) or path)
+                last_opened = str(item.get("last_opened", "")).strip()
+                favorite = bool(item.get("favorite", False))
+            else:
+                continue
+
+            if not path:
+                continue
+
+            abs_path = os.path.abspath(os.path.expanduser(path))
+            if abs_path in seen_paths or not os.path.isdir(abs_path):
+                continue
+
+            seen_paths.add(abs_path)
+            normalized.append(
+                {
+                    "path": abs_path,
+                    "label": label,
+                    "last_opened": last_opened,
+                    "favorite": favorite,
+                }
+            )
+
+        normalized.sort(key=lambda item: (not item.get("favorite", False), item.get("label", "").lower()))
+        return normalized[:12]
+
+    def _remember_recent_project(self, path: str) -> None:
+        target = os.path.abspath(os.path.expanduser(path or ""))
+        if not target or not os.path.isdir(target):
+            return
+
+        recent = self._normalized_recent_projects()
+        recent = [item for item in recent if item["path"] != target]
+        recent.insert(
+            0,
+            {
+                "path": target,
+                "label": os.path.basename(target) or target,
+                "last_opened": datetime.now().isoformat(timespec="seconds"),
+                "favorite": False,
+            },
+        )
+        self.config_data["recent_projects"] = recent[:12]
+        try:
+            self._save_config()
+        except Exception:
+            pass
+
+    def _project_metadata_path(self, project_path: str) -> str:
+        return os.path.join(project_path, ".willy", "project.json")
+
+    def _load_project_metadata(self, project_path: str) -> dict:
+        meta_path = self._project_metadata_path(project_path)
+        if not os.path.isfile(meta_path):
+            return {}
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_project_metadata(self, project_path: str, metadata: dict) -> None:
+        os.makedirs(os.path.join(project_path, ".willy"), exist_ok=True)
+        with open(self._project_metadata_path(project_path), "w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, indent=4)
+
+    def _store_project_artifacts(
+        self,
+        project_path: str,
+        svg_path: str = "",
+        bom_path: str = "",
+        net_path: str = "",
+    ) -> None:
+        metadata = self._load_project_metadata(project_path)
+        artifacts = dict(metadata.get("artifacts", {})) if isinstance(metadata.get("artifacts", {}), dict) else {}
+        if svg_path:
+            artifacts["svg"] = svg_path
+        if bom_path:
+            artifacts["bom"] = bom_path
+        if net_path:
+            artifacts["net"] = net_path
+        metadata["artifacts"] = artifacts
+        self._save_project_metadata(project_path, metadata)
+
+    def _path_belongs_to_project(self, path: str, project_path: str) -> bool:
+        if not path or not project_path:
+            return False
+        try:
+            path_abs = os.path.abspath(path)
+            project_abs = os.path.abspath(project_path)
+            common = os.path.commonpath([path_abs, project_abs])
+            return common == project_abs
+        except Exception:
+            return False
+
+    def _project_name_tokens(self, project_path: str) -> list[str]:
+        project_name = os.path.basename(project_path or "").strip().lower()
+        if not project_name:
+            return []
+        normalized = project_name.replace("-", "_").replace(" ", "_")
+        compact = normalized.replace("_", "")
+        return list({project_name, normalized, compact})
+
+    def _resolve_project_code_path(self, project_path: str) -> str:
+        selected = self._project_code_selection.get(project_path, "")
+        if selected and os.path.isfile(selected) and self._path_belongs_to_project(selected, project_path):
+            return selected
+
+        current = self._current_code_path
+        if current and os.path.isfile(current) and self._path_belongs_to_project(current, project_path):
+            return current
+
+        main_cpp = os.path.join(project_path, "src", "main.cpp")
+        return main_cpp if os.path.isfile(main_cpp) else ""
+
+    def _resolve_project_artifacts(self, project_path: str) -> tuple[str, str, str]:
+        metadata = self._load_project_metadata(project_path)
+        artifacts = metadata.get("artifacts", {}) if isinstance(metadata.get("artifacts", {}), dict) else {}
+        svg = str(artifacts.get("svg", "")).strip()
+        bom = str(artifacts.get("bom", "")).strip()
+        net = str(artifacts.get("net", "")).strip()
+        svg = svg if svg and os.path.isfile(svg) else ""
+        bom = bom if bom and os.path.isfile(bom) else ""
+        net = net if net and os.path.isfile(net) else ""
+
+        fallback_svg, fallback_bom, fallback_net = self._find_latest_schematic_assets(project_path)
+        return (
+            svg or fallback_svg,
+            bom or fallback_bom,
+            net or fallback_net,
+        )
+
+    def _build_project_view_snapshot(self, project_path: str, project_info: dict | None = None) -> dict:
+        info = project_info or {}
+        code_path = self._resolve_project_code_path(project_path) if project_path else ""
+        svg_path, bom_path, net_path = self._resolve_project_artifacts(project_path) if project_path else ("", "", "")
+        return {
+            "project_path": project_path or "",
+            "project_info": info,
+            "code_path": code_path,
+            "svg_path": svg_path,
+            "bom_path": bom_path,
+            "net_path": net_path,
+        }
+
+    def _apply_project_view_snapshot(self, snapshot: dict, force_code_refresh: bool = True) -> None:
+        self._project_view_snapshot = snapshot
+        self._latest_schematic_path = snapshot.get("svg_path", "") or ""
+        self._latest_bom_path = snapshot.get("bom_path", "") or ""
+        self._active_netlist_path = snapshot.get("net_path", "") or ""
+
+        code_path = snapshot.get("code_path", "") or ""
+        if force_code_refresh:
+            if code_path and os.path.isfile(code_path):
+                self._update_code_preview(code_path)
+            else:
+                self._show_project_code_placeholder(snapshot.get("project_path", ""))
+
+        self._update_diagram_status()
+        self._update_schematic_preview(self._latest_schematic_path)
+        self._update_wiring_summary()
+        self._refresh_flow_diagram_text()
+
+    def _refresh_project_views(
+        self,
+        project_path: str | None = None,
+        project_info: dict | None = None,
+        force_code_refresh: bool = True,
+    ) -> None:
+        target_project = project_path if project_path is not None else self._active_project_path
+        snapshot = self._build_project_view_snapshot(target_project or "", project_info=project_info)
+        self._apply_project_view_snapshot(snapshot, force_code_refresh=force_code_refresh)
+
+    def _refresh_project_views_from_path(self, path: str, force_code_refresh: bool = False) -> None:
+        self._current_code_path = path
+        self._update_active_project_if_changed()
+        if self._active_project_path and self._path_belongs_to_project(path, self._active_project_path):
+            self._project_code_selection[self._active_project_path] = path
+        self._refresh_project_views(force_code_refresh=force_code_refresh)
+
+    def _show_project_code_placeholder(self, project_path: str) -> None:
+        preview = (
+            f"Proyecto activo: {project_path}\n\n"
+            "No se encontró src/main.cpp en este proyecto.\n"
+            "Selecciona un archivo desde el explorador para ver su contenido."
+        ) if project_path else "Selecciona un archivo para ver el codigo en desarrollo..."
+
+        if hasattr(self, "code_preview"):
+            self.code_preview.configure(state="normal")
+            self.code_preview.delete("0.0", "end")
+            self.code_preview.insert("0.0", preview)
+            self.code_preview.configure(state="disabled")
+
+        if self._code_expand_text is not None and self._code_expand_text.winfo_exists():
+            self._code_expand_text.configure(state="normal")
+            self._code_expand_text.delete("0.0", "end")
+            self._code_expand_text.insert("0.0", preview)
+            self._code_expand_text.configure(state="disabled")
+
+    def _update_diagram_status(self) -> None:
+        if not hasattr(self, "diagram_status_label"):
+            return
+        if self._latest_schematic_path and os.path.isfile(self._latest_schematic_path):
+            display_name = os.path.basename(self._latest_schematic_path)
+            self.diagram_status_label.configure(text=f"Diagrama: {display_name}")
+            self.diagram_open_btn.configure(state="normal")
+        else:
+            self.diagram_status_label.configure(text="Diagrama: no disponible para el proyecto activo")
+            self.diagram_open_btn.configure(state="disabled")
+
+    def _ensure_project_downloads_dir(self, project_path: str) -> str:
+        metadata = self._load_project_metadata(project_path)
+        downloads_rel = str(metadata.get("downloads_dir", "")).strip() or ".willy/downloads"
+        downloads_path = os.path.join(project_path, *downloads_rel.split("/"))
+        os.makedirs(downloads_path, exist_ok=True)
+        metadata["downloads_dir"] = downloads_rel
+        self._save_project_metadata(project_path, metadata)
+        return downloads_path
+
+    def _append_lib_dep_to_ini(self, project_path: str, spec: str) -> tuple[bool, str]:
+        dep_spec = spec.strip()
+        if not dep_spec:
+            return False, ""
+
+        existing = self.arduino_manager._collect_lib_deps_from_ini(project_path)
+        existing_names = {
+            self.arduino_manager._lib_project_name(item).lower(): item
+            for item in existing
+        }
+        project_name = self.arduino_manager._lib_project_name(dep_spec).lower()
+        if project_name and project_name in existing_names:
+            return False, existing_names[project_name]
+
+        ini_path = os.path.join(project_path, "platformio.ini")
+        with open(ini_path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+
+        first_env_start = None
+        section_end = len(lines)
+        lib_deps_index = None
+        insert_index = None
+
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("[env:") and stripped.endswith("]"):
+                if first_env_start is None:
+                    first_env_start = idx
+                    continue
+                section_end = idx
+                break
+
+        if first_env_start is None:
+            return False, ""
+
+        for idx in range(first_env_start + 1, section_end):
+            stripped = lines[idx].strip()
+            if stripped.lower().startswith("lib_deps"):
+                lib_deps_index = idx
+                insert_index = idx + 1
+                while insert_index < section_end and lines[insert_index].startswith((" ", "\t")):
+                    insert_index += 1
+                break
+
+        if lib_deps_index is None:
+            insert_index = section_end
+            lines[insert_index:insert_index] = ["", "lib_deps =", f"    {dep_spec}"]
+        else:
+            lines.insert(insert_index, f"    {dep_spec}")
+
+        with open(ini_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines).rstrip() + "\n")
+
+        return True, dep_spec
+
+    def _remove_recent_project(self, target_path: str) -> None:
+        normalized = self._normalized_recent_projects()
+        target = os.path.abspath(os.path.expanduser(target_path))
+        self.config_data["recent_projects"] = [
+            item for item in normalized if item["path"] != target
+        ]
+        try:
+            self._save_config()
+        except Exception:
+            pass
+
+    def _toggle_recent_project_favorite(self, target_path: str) -> None:
+        normalized = self._normalized_recent_projects()
+        target = os.path.abspath(os.path.expanduser(target_path))
+        for item in normalized:
+            if item["path"] == target:
+                item["favorite"] = not bool(item.get("favorite", False))
+                break
+        normalized.sort(
+            key=lambda item: (
+                not item.get("favorite", False),
+                item.get("label", "").lower(),
+            )
+        )
+        self.config_data["recent_projects"] = normalized[:12]
+        try:
+            self._save_config()
+        except Exception:
+            pass
+
+    def _choose_workspace_folder(self) -> None:
+        initial_dir = self.terminal_manager.get_cwd()
+        folder = tk.filedialog.askdirectory(
+            initialdir=initial_dir,
+            title=i18n.get("open_folder_btn"),
+        )
+        if folder:
+            self._apply_workspace_root(folder)
+
+    def _apply_workspace_root(self, folder: str, announce: bool = True) -> None:
+        root = os.path.abspath(os.path.expanduser(folder))
+        if not os.path.isdir(root):
+            return
+
+        self.terminal_manager.change_directory(root)
+        if hasattr(self, "file_browser"):
+            self.file_browser.navigate_to(root)
+
+        if "initial_directory" not in self._locked_config_keys:
+            self.config_data["initial_directory"] = root
+            try:
+                self._save_config()
+            except Exception:
+                pass
+
+        self._current_code_path = ""
+        self._update_active_project_if_changed()
+        self._remember_recent_project(self._active_project_path or root)
+
+        if announce:
+            self.chat_panel.add_message(
+                "system",
+                i18n.get("workspace_opened", path=root),
+            )
+
+    def _default_project_preset_label(self) -> str:
+        default_board = str(self.config_data.get("default_board", "")).strip().lower()
+        for label, preset in PROJECT_PRESETS.items():
+            if preset["board"].lower() == default_board:
+                return label
+        return "Arduino Uno"
+
+    def _render_platformio_ini(self, preset: dict) -> str:
+        return (
+            f"[env:{preset['board']}]\n"
+            f"platform = {preset['platform']}\n"
+            f"board = {preset['board']}\n"
+            f"framework = {preset['framework']}\n\n"
+            "; Agrega dependencias reproducibles aqui cuando Willy instale librerias remotas\n"
+            "; lib_deps =\n"
+        )
+
+    def _render_main_cpp(self, template_label: str) -> str:
+        template = PROJECT_TEMPLATES.get(template_label, PROJECT_TEMPLATES["Blink"])
+        return str(template.get("code", PROJECT_TEMPLATES["Blink"]["code"]))
+
+    def _render_project_agents_md(self, project_name: str, preset: dict, template_label: str) -> str:
+        board = str(preset.get("board", "")).strip() or "(definir)"
+        platform_name = str(preset.get("platform", "")).strip() or "(definir)"
+        framework = str(preset.get("framework", "")).strip() or "(definir)"
+        return (
+            f"# AGENTS\n\n"
+            f"## Objetivo\n"
+            f"Proyecto {project_name} para firmware embebido con enfoque IoT. "
+            f"Template inicial: {template_label}.\n\n"
+            f"## Hardware\n"
+            f"- Board principal: {board}\n"
+            f"- Plataforma: {platform_name}\n"
+            f"- Framework: {framework}\n"
+            f"- Componentes conectados: completar segun laboratorio\n\n"
+            f"## Reglas\n"
+            f"- Priorizar respuestas sobre este proyecto activo antes que ejemplos genericos.\n"
+            f"- Si falta un dato de cableado o pinout, pedir confirmacion breve y continuar.\n"
+            f"- Proponer pasos ejecutables en PlatformIO y validar antes de upload.\n"
+            f"- Mantener respuestas tecnicas, claras y orientadas a implementacion.\n"
+        )
+
+    def _create_project_structure(
+        self,
+        project_path: str,
+        project_name: str,
+        preset_label: str,
+        template_label: str,
+        create_downloads_dir: bool,
+    ) -> str:
+        preset = PROJECT_PRESETS[preset_label]
+        os.makedirs(project_path, exist_ok=False)
+
+        for relative_dir in ["src", "lib", "include", "test", "outputs", ".willy"]:
+            os.makedirs(os.path.join(project_path, relative_dir), exist_ok=True)
+
+        downloads_rel = ".willy/downloads"
+        if create_downloads_dir:
+            os.makedirs(os.path.join(project_path, ".willy", "downloads"), exist_ok=True)
+
+        with open(os.path.join(project_path, "platformio.ini"), "w", encoding="utf-8") as fh:
+            fh.write(self._render_platformio_ini(preset))
+
+        main_cpp_path = os.path.join(project_path, "src", "main.cpp")
+        with open(main_cpp_path, "w", encoding="utf-8") as fh:
+            fh.write(self._render_main_cpp(template_label))
+
+        metadata = {
+            "name": project_name,
+            "board": preset["board"],
+            "platform": preset["platform"],
+            "framework": preset["framework"],
+            "template": template_label,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "custom_lib_dir": "lib",
+            "downloads_dir": downloads_rel if create_downloads_dir else "",
+        }
+        with open(
+            os.path.join(project_path, ".willy", "project.json"),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(metadata, fh, indent=4)
+
+        agents_path = os.path.join(project_path, ".willy", "AGENTS.md")
+        with open(agents_path, "w", encoding="utf-8") as fh:
+            fh.write(self._render_project_agents_md(project_name, preset, template_label))
+
+        return main_cpp_path
+
+    def _open_new_project_dialog(self) -> None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(i18n.get("project_dialog_title"))
+        dialog.geometry("560x320")
+        dialog.minsize(520, 300)
+        dialog.transient(self)
+
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            pass
+
+        card = ctk.CTkFrame(dialog, corner_radius=14)
+        card.pack(fill="both", expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            card,
+            text=i18n.get("project_dialog_title"),
+            font=ctk.CTkFont(size=18, weight="bold"),
+            anchor="w",
+        ).pack(anchor="w", padx=18, pady=(16, 4))
+
+        ctk.CTkLabel(
+            card,
+            text=i18n.get("project_dialog_hint"),
+            font=ctk.CTkFont(size=11),
+            text_color=("gray45", "gray65"),
+            anchor="w",
+        ).pack(anchor="w", padx=18, pady=(0, 10))
+
+        form = ctk.CTkFrame(card, fg_color="transparent")
+        form.pack(fill="both", expand=True, padx=18, pady=(0, 10))
+        form.grid_columnconfigure(1, weight=1)
+
+        name_var = tk.StringVar(value="")
+        base_var = tk.StringVar(value=self.terminal_manager.get_cwd())
+        preset_label_var = tk.StringVar(value=self._default_project_preset_label())
+        template_label_var = tk.StringVar(value="Base Generica")
+        downloads_var = tk.BooleanVar(value=True)
+        feedback_var = tk.StringVar(value="")
+
+        ctk.CTkLabel(form, text=i18n.get("project_name_label")).grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
+        ctk.CTkEntry(form, textvariable=name_var, width=280).grid(
+            row=0, column=1, sticky="ew", pady=(0, 8)
+        )
+
+        ctk.CTkLabel(form, text=i18n.get("project_location_label")).grid(
+            row=1, column=0, sticky="w", pady=(0, 8)
+        )
+        base_row = ctk.CTkFrame(form, fg_color="transparent")
+        base_row.grid(row=1, column=1, sticky="ew", pady=(0, 8))
+        base_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkEntry(base_row, textvariable=base_var).grid(
+            row=0, column=0, sticky="ew", padx=(0, 8)
+        )
+
+        def _browse_project_base() -> None:
+            selected = tk.filedialog.askdirectory(
+                initialdir=os.path.expanduser(base_var.get() or "~"),
+                title=i18n.get("project_location_label"),
+            )
+            if selected:
+                base_var.set(selected)
+
+        ctk.CTkButton(
+            base_row,
+            text=i18n.get("browse_btn"),
+            width=100,
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=_browse_project_base,
+        ).grid(row=0, column=1, sticky="e")
+
+        ctk.CTkLabel(form, text=i18n.get("project_board_label")).grid(
+            row=2, column=0, sticky="w", pady=(0, 8)
+        )
+        ctk.CTkOptionMenu(
+            form,
+            values=list(PROJECT_PRESETS.keys()),
+            variable=preset_label_var,
+        ).grid(row=2, column=1, sticky="w", pady=(0, 8))
+
+        ctk.CTkLabel(form, text=i18n.get("project_template_label")).grid(
+            row=3, column=0, sticky="w", pady=(0, 8)
+        )
+        ctk.CTkOptionMenu(
+            form,
+            values=list(PROJECT_TEMPLATES.keys()),
+            variable=template_label_var,
+        ).grid(row=3, column=1, sticky="w", pady=(0, 8))
+
+        ctk.CTkCheckBox(
+            form,
+            text=i18n.get("project_downloads_label"),
+            variable=downloads_var,
+            onvalue=True,
+            offvalue=False,
+        ).grid(row=4, column=1, sticky="w", pady=(2, 8))
+
+        ctk.CTkLabel(
+            form,
+            textvariable=feedback_var,
+            text_color=("#b91c1c", "#fca5a5"),
+            anchor="w",
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        button_row = ctk.CTkFrame(card, fg_color="transparent")
+        button_row.pack(fill="x", padx=18, pady=(0, 16))
+
+        def _create_project() -> None:
+            project_name = name_var.get().strip()
+            base_folder = os.path.abspath(os.path.expanduser(base_var.get().strip() or "~"))
+            preset_label = preset_label_var.get().strip()
+            template_label = template_label_var.get().strip()
+
+            if not project_name:
+                feedback_var.set(i18n.get("project_name_label"))
+                return
+            if preset_label not in PROJECT_PRESETS:
+                feedback_var.set(i18n.get("project_board_label"))
+                return
+            if template_label not in PROJECT_TEMPLATES:
+                feedback_var.set(i18n.get("project_template_label"))
+                return
+            if not os.path.isdir(base_folder):
+                feedback_var.set("La carpeta base no existe.")
+                return
+
+            project_path = os.path.join(base_folder, project_name)
+            if os.path.exists(project_path):
+                feedback_var.set("Ya existe una carpeta con ese nombre.")
+                return
+
+            try:
+                main_cpp_path = self._create_project_structure(
+                    project_path,
+                    project_name,
+                    preset_label,
+                    template_label,
+                    create_downloads_dir=bool(downloads_var.get()),
+                )
+            except Exception as exc:
+                feedback_var.set(f"No se pudo crear el proyecto: {exc}")
+                return
+
+            preset = PROJECT_PRESETS[preset_label]
+            self.config_data["default_board"] = preset["board"]
+            try:
+                self._save_config()
+            except Exception:
+                pass
+
+            self._apply_workspace_root(project_path, announce=False)
+            self._update_code_preview(main_cpp_path)
+            self._update_active_project_if_changed()
+            self.chat_panel.add_message(
+                "system",
+                i18n.get("project_created", path=project_path),
+            )
+            dialog.destroy()
+
+        ctk.CTkButton(
+            button_row,
+            text=i18n.get("settings_cancel"),
+            width=120,
+            fg_color=("gray70", "gray30"),
+            hover_color=("gray60", "gray40"),
+            command=dialog.destroy,
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            button_row,
+            text=i18n.get("project_create_btn"),
+            width=160,
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            command=_create_project,
+        ).pack(side="right")
+
+    def _open_recent_projects_dialog(self) -> None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(i18n.get("recent_projects_title"))
+        dialog.geometry("520x360")
+        dialog.minsize(460, 280)
+        dialog.transient(self)
+
+        card = ctk.CTkFrame(dialog, corner_radius=14)
+        card.pack(fill="both", expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            card,
+            text=i18n.get("recent_projects_title"),
+            font=ctk.CTkFont(size=18, weight="bold"),
+            anchor="w",
+        ).pack(anchor="w", padx=18, pady=(16, 10))
+
+        recent = self._normalized_recent_projects()
+        body = ctk.CTkScrollableFrame(card, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+
+        if not recent:
+            ctk.CTkLabel(
+                body,
+                text=i18n.get("recent_projects_empty"),
+                text_color=("gray45", "gray65"),
+                anchor="w",
+            ).pack(anchor="w")
+        else:
+            for item in recent:
+                label = item["label"]
+                path = item["path"]
+                last_opened = item.get("last_opened", "")
+                favorite = bool(item.get("favorite", False))
+                row = ctk.CTkFrame(body, fg_color=("gray93", "gray17"), corner_radius=10)
+                row.pack(fill="x", pady=(0, 8))
+                ctk.CTkLabel(
+                    row,
+                    text=f"{'★ ' if favorite else ''}{label}\n{path}",
+                    justify="left",
+                    anchor="w",
+                ).pack(side="left", fill="x", expand=True, padx=12, pady=10)
+                if last_opened:
+                    ctk.CTkLabel(
+                        row,
+                        text=last_opened,
+                        font=ctk.CTkFont(size=10),
+                        text_color=("gray45", "gray65"),
+                    ).pack(side="left", padx=(0, 10))
+                ctk.CTkButton(
+                    row,
+                    text=(
+                        i18n.get("recent_projects_unfavorite_btn")
+                        if favorite else i18n.get("recent_projects_favorite_btn")
+                    ),
+                    width=108,
+                    fg_color=("gray70", "gray35"),
+                    hover_color=("gray60", "gray45"),
+                    command=lambda p=path, win=dialog: (
+                        self._toggle_recent_project_favorite(p),
+                        win.destroy(),
+                        self._open_recent_projects_dialog(),
+                    ),
+                ).pack(side="right", padx=(0, 8), pady=10)
+                ctk.CTkButton(
+                    row,
+                    text=i18n.get("recent_projects_remove_btn"),
+                    width=86,
+                    fg_color=("gray70", "gray35"),
+                    hover_color=("gray60", "gray45"),
+                    command=lambda p=path, win=dialog: (
+                        self._remove_recent_project(p),
+                        win.destroy(),
+                        self._open_recent_projects_dialog(),
+                    ),
+                ).pack(side="right", padx=(0, 8), pady=10)
+                ctk.CTkButton(
+                    row,
+                    text=i18n.get("open_folder_btn"),
+                    width=92,
+                    fg_color="#2563eb",
+                    hover_color="#1d4ed8",
+                    command=lambda p=path, win=dialog: (self._apply_workspace_root(p), win.destroy()),
+                ).pack(side="right", padx=10, pady=10)
+
+        ctk.CTkButton(
+            card,
+            text=i18n.get("settings_cancel"),
+            width=120,
+            fg_color=("gray70", "gray30"),
+            hover_color=("gray60", "gray40"),
+            command=dialog.destroy,
+        ).pack(anchor="e", padx=18, pady=(0, 16))
+
+    def _open_project_dependencies_dialog(self) -> None:
+        project_path = self._resolve_project_path_for_actions()
+        if not project_path or not os.path.isfile(os.path.join(project_path, "platformio.ini")):
+            self.chat_panel.add_message("error", i18n.get("project_deps_no_active"))
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(i18n.get("project_deps_title"))
+        dialog.geometry("620x420")
+        dialog.minsize(560, 360)
+        dialog.transient(self)
+
+        metadata = self._load_project_metadata(project_path)
+        current_specs = self.arduino_manager._collect_lib_deps_from_ini(project_path)
+        feedback_var = tk.StringVar(value="")
+        spec_var = tk.StringVar(value="")
+        search_var = tk.StringVar(value="")
+
+        card = ctk.CTkFrame(dialog, corner_radius=14)
+        card.pack(fill="both", expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            card,
+            text=i18n.get("project_deps_title"),
+            font=ctk.CTkFont(size=18, weight="bold"),
+            anchor="w",
+        ).pack(anchor="w", padx=18, pady=(16, 6))
+
+        ctk.CTkLabel(
+            card,
+            text=project_path,
+            font=ctk.CTkFont(size=10),
+            text_color=("gray45", "gray65"),
+            anchor="w",
+        ).pack(anchor="w", padx=18, pady=(0, 10))
+
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=18, pady=(0, 10))
+        body.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(body, text=i18n.get("project_deps_current")).grid(
+            row=0, column=0, sticky="w", pady=(0, 6)
+        )
+
+        deps_box = ctk.CTkTextbox(body, height=160, wrap="word")
+        deps_box.grid(row=1, column=0, sticky="nsew")
+        deps_box.insert(
+            "0.0",
+            "\n".join(current_specs) if current_specs else "(sin dependencias declaradas)",
+        )
+        deps_box.configure(state="disabled")
+
+        downloads_hint = str(metadata.get("downloads_dir", "")).strip() or ".willy/downloads"
+        ctk.CTkLabel(
+            body,
+            text=f"Downloads del proyecto: {downloads_hint}",
+            font=ctk.CTkFont(size=10),
+            text_color=("gray45", "gray65"),
+            anchor="w",
+        ).grid(row=2, column=0, sticky="w", pady=(8, 6))
+
+        add_row = ctk.CTkFrame(body, fg_color="transparent")
+        add_row.grid(row=3, column=0, sticky="ew")
+        add_row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(add_row, text=i18n.get("project_deps_add")).grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        ctk.CTkEntry(add_row, textvariable=spec_var).grid(row=0, column=1, sticky="ew")
+
+        ctk.CTkLabel(
+            body,
+            textvariable=feedback_var,
+            text_color=("#166534", "#86efac"),
+            anchor="w",
+        ).grid(row=4, column=0, sticky="ew", pady=(8, 0))
+
+        search_row = ctk.CTkFrame(body, fg_color="transparent")
+        search_row.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        search_row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(search_row, text=i18n.get("project_deps_search")).grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        ctk.CTkEntry(search_row, textvariable=search_var).grid(
+            row=0, column=1, sticky="ew"
+        )
+
+        search_results = ctk.CTkScrollableFrame(body, fg_color=("gray93", "gray17"), height=120)
+        search_results.grid(row=6, column=0, sticky="nsew", pady=(8, 0))
+
+        def _clear_search_results() -> None:
+            for widget in search_results.winfo_children():
+                widget.destroy()
+
+        def _use_search_result(spec: str) -> None:
+            spec_var.set(spec)
+            feedback_var.set(spec)
+
+        def _render_search_results(items: list[dict]) -> None:
+            _clear_search_results()
+            if not items:
+                ctk.CTkLabel(
+                    search_results,
+                    text=i18n.get("project_deps_search_empty"),
+                    text_color=("gray45", "gray65"),
+                    anchor="w",
+                ).pack(anchor="w", padx=10, pady=10)
+                return
+
+            for item in items:
+                row = ctk.CTkFrame(search_results, fg_color=("gray88", "gray20"), corner_radius=8)
+                row.pack(fill="x", padx=4, pady=4)
+                title = item.get("name", item.get("spec", ""))
+                version = item.get("version", "")
+                description = item.get("description", "")
+                summary = title if not version else f"{title} @ {version}"
+                ctk.CTkLabel(
+                    row,
+                    text=f"{summary}\n{description}".strip(),
+                    justify="left",
+                    anchor="w",
+                    wraplength=360,
+                ).pack(side="left", fill="x", expand=True, padx=10, pady=8)
+                ctk.CTkButton(
+                    row,
+                    text=i18n.get("project_deps_add_btn"),
+                    width=92,
+                    fg_color="#2563eb",
+                    hover_color="#1d4ed8",
+                    command=lambda spec=item.get("spec", ""): _use_search_result(spec),
+                ).pack(side="right", padx=10, pady=8)
+
+        def _search_dependencies() -> None:
+            query = search_var.get().strip()
+            if not query:
+                _clear_search_results()
+                feedback_var.set(i18n.get("project_deps_search"))
+                return
+
+            feedback_var.set(i18n.get("project_deps_searching"))
+
+            def _worker() -> None:
+                result = self.arduino_manager.search_libraries(query)
+
+                def _finish() -> None:
+                    if not result.get("ok"):
+                        feedback_var.set(result.get("error", i18n.get("project_deps_search_empty")))
+                        _clear_search_results()
+                        return
+                    _render_search_results(result.get("results", []))
+                    if result.get("results"):
+                        feedback_var.set("")
+                    else:
+                        feedback_var.set(i18n.get("project_deps_search_empty"))
+
+                self.after(0, _finish)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        button_row = ctk.CTkFrame(card, fg_color="transparent")
+        button_row.pack(fill="x", padx=18, pady=(0, 16))
+
+        def _refresh_dependency_view() -> None:
+            updated_specs = self.arduino_manager._collect_lib_deps_from_ini(project_path)
+            deps_box.configure(state="normal")
+            deps_box.delete("0.0", "end")
+            deps_box.insert(
+                "0.0",
+                "\n".join(updated_specs) if updated_specs else "(sin dependencias declaradas)",
+            )
+            deps_box.configure(state="disabled")
+
+        def _add_dependency() -> None:
+            changed, resolved_spec = self._append_lib_dep_to_ini(project_path, spec_var.get())
+            if not resolved_spec:
+                feedback_var.set(i18n.get("project_deps_add"))
+                return
+            if not changed:
+                feedback_var.set(i18n.get("project_deps_exists"))
+                return
+
+            latest_specs = self.arduino_manager._collect_lib_deps_from_ini(project_path)
+            latest_meta = self._load_project_metadata(project_path)
+            latest_meta["managed_dependencies"] = latest_specs
+            self._save_project_metadata(project_path, latest_meta)
+            spec_var.set("")
+            feedback_var.set(i18n.get("project_deps_added", spec=resolved_spec))
+            self.chat_panel.add_message("system", i18n.get("project_deps_added", spec=resolved_spec))
+            _refresh_dependency_view()
+
+        def _install_dependencies(add_current_spec: bool = False) -> None:
+            if add_current_spec:
+                changed, resolved_spec = self._append_lib_dep_to_ini(project_path, spec_var.get())
+                if not resolved_spec:
+                    feedback_var.set(i18n.get("project_deps_add"))
+                    return
+                if changed:
+                    latest_meta = self._load_project_metadata(project_path)
+                    latest_meta["managed_dependencies"] = self.arduino_manager._collect_lib_deps_from_ini(project_path)
+                    self._save_project_metadata(project_path, latest_meta)
+                    spec_var.set("")
+                    _refresh_dependency_view()
+
+            feedback_var.set(i18n.get("project_deps_installing"))
+            self.chat_panel.add_message("system", i18n.get("project_deps_installing"))
+            env = self._select_env_for_project(project_path)
+
+            def _worker() -> None:
+                result = self.arduino_manager.install_declared_dependencies(project_path, env=env)
+
+                def _finish() -> None:
+                    if result.get("ok"):
+                        feedback_var.set(i18n.get("project_deps_installed"))
+                        self.chat_panel.add_message("system", i18n.get("project_deps_installed"))
+                    else:
+                        error_text = result.get("error", "Error desconocido")
+                        feedback_var.set(i18n.get("project_deps_install_error", error=error_text))
+                        self.chat_panel.add_message(
+                            "error",
+                            i18n.get("project_deps_install_error", error=error_text),
+                        )
+
+                self.after(0, _finish)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _prepare_downloads_dir() -> None:
+            downloads_path = self._ensure_project_downloads_dir(project_path)
+            feedback_var.set(i18n.get("project_deps_ready", path=downloads_path))
+            self.chat_panel.add_message("system", i18n.get("project_deps_ready", path=downloads_path))
+
+        ctk.CTkButton(
+            button_row,
+            text=i18n.get("project_deps_downloads_btn"),
+            width=220,
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=_prepare_downloads_dir,
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            button_row,
+            text=i18n.get("project_deps_search_btn"),
+            width=110,
+            fg_color=("gray70", "gray35"),
+            hover_color=("gray60", "gray45"),
+            command=_search_dependencies,
+        ).pack(side="left", padx=(8, 0))
+
+        ctk.CTkButton(
+            button_row,
+            text=i18n.get("project_deps_add_btn"),
+            width=110,
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            command=_add_dependency,
+        ).pack(side="right", padx=(8, 0))
+
+        ctk.CTkButton(
+            button_row,
+            text=i18n.get("project_deps_install_btn"),
+            width=150,
+            fg_color="#16a34a",
+            hover_color="#15803d",
+            command=lambda: _install_dependencies(add_current_spec=True),
+        ).pack(side="right", padx=(8, 0))
+
+        ctk.CTkButton(
+            button_row,
+            text=i18n.get("settings_cancel"),
+            width=110,
+            fg_color=("gray70", "gray30"),
+            hover_color=("gray60", "gray40"),
+            command=dialog.destroy,
+        ).pack(side="right")
+
     def _set_iot_action_buttons_state(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
         if hasattr(self, "compile_btn"):
@@ -1355,6 +2902,8 @@ class WillyApp(ctk.CTk):
         if self._iot_action_running:
             return
         self._iot_action_running = True
+        self._last_iot_action_kind = "compile"
+        self._last_iot_action_ok = None
         self._last_iot_action_state = "compiling"
         self._set_iot_action_buttons_state(False)
         self._set_code_action_indicator("compiling")
@@ -1371,6 +2920,8 @@ class WillyApp(ctk.CTk):
         self._iot_action_running = False
         self._set_iot_action_buttons_state(True)
         ok = bool(result.get("ok"))
+        self._last_iot_action_kind = "compile"
+        self._last_iot_action_ok = ok
         self._last_iot_action_state = "success" if ok else "error"
         self._set_code_action_indicator("success" if ok else "error")
         if ok:
@@ -1387,6 +2938,8 @@ class WillyApp(ctk.CTk):
         if self._iot_action_running:
             return
         self._iot_action_running = True
+        self._last_iot_action_kind = "upload"
+        self._last_iot_action_ok = None
         self._last_iot_action_state = "uploading"
         self._set_iot_action_buttons_state(False)
         self._set_code_action_indicator("uploading")
@@ -1404,6 +2957,8 @@ class WillyApp(ctk.CTk):
         self._iot_action_running = False
         self._set_iot_action_buttons_state(True)
         ok = bool(result.get("ok"))
+        self._last_iot_action_kind = "upload"
+        self._last_iot_action_ok = ok
         self._last_iot_action_state = "success" if ok else "error"
         self._set_code_action_indicator("success" if ok else "error")
         if ok:
@@ -1808,65 +3363,53 @@ class WillyApp(ctk.CTk):
         self._device_poll_job = self.after(5000, self._trigger_device_scan)
 
     def _refresh_latest_schematic(self) -> None:
-        latest_svg, latest_bom, latest_net = self._find_latest_schematic_assets()
-        if latest_svg:
-            self._latest_schematic_path = latest_svg
-        if latest_bom:
-            self._latest_bom_path = latest_bom
-        if latest_net:
-            self._active_netlist_path = latest_net
-
-        if hasattr(self, "diagram_status_label"):
-            if self._latest_schematic_path and os.path.isfile(self._latest_schematic_path):
-                display_name = os.path.basename(self._latest_schematic_path)
-                self.diagram_status_label.configure(text=f"Diagrama: {display_name}")
-                self.diagram_open_btn.configure(state="normal")
-            else:
-                self.diagram_status_label.configure(text="Diagrama: sin generar en esta sesión")
-                self.diagram_open_btn.configure(state="disabled")
-
-        self._update_schematic_preview(self._latest_schematic_path)
-        self._update_wiring_summary()
-        self._refresh_flow_diagram_text()
+        self._refresh_project_views(force_code_refresh=False)
 
         self._schedule_next_diagram_poll()
 
-    def _find_latest_schematic_assets(self) -> tuple[str, str, str]:
+    def _find_latest_schematic_assets(self, project_path: str = "") -> tuple[str, str, str]:
         schem_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "outputs", "schematics")
         if not os.path.isdir(schem_dir):
             return "", "", ""
 
-        project_hint = os.path.basename(self._active_project_path).lower() if self._active_project_path else ""
+        project_tokens = self._project_name_tokens(project_path)
 
         def _latest(paths: list[str]) -> str:
             return max(paths, key=os.path.getmtime) if paths else ""
 
-        def _pick(ext: str) -> str:
-            all_paths = [
+        def _matches_project(path: str) -> bool:
+            if not project_tokens:
+                return False
+            name = os.path.basename(path).lower().replace("-", "_").replace(" ", "_")
+            compact = name.replace("_", "")
+            return any(token and (token in name or token in compact) for token in project_tokens)
+
+        def _paths_for(ext: str) -> list[str]:
+            return [
                 os.path.join(schem_dir, name)
                 for name in os.listdir(schem_dir)
                 if name.lower().endswith(ext)
             ]
-            if not all_paths:
-                return ""
 
-            session_paths = [
-                path for path in all_paths
-                if os.path.getmtime(path) >= (self._app_session_start_ts - 1.0)
-            ]
-            preferred = session_paths or all_paths
-            if project_hint:
-                related = [
-                    path for path in preferred
-                    if project_hint in os.path.basename(path).lower()
-                ]
-                if related:
-                    return _latest(related)
-            return _latest(preferred)
+        all_svgs = _paths_for(".svg")
+        all_boms = _paths_for("_bom.csv")
+        all_nets = _paths_for(".net")
 
-        svg = _pick(".svg")
-        bom = _pick("_bom.csv")
-        net = _pick(".net")
+        if project_tokens:
+            related_svgs = [path for path in all_svgs if _matches_project(path)]
+            related_boms = [path for path in all_boms if _matches_project(path)]
+            related_nets = [path for path in all_nets if _matches_project(path)]
+            svg = _latest(related_svgs)
+            bom = _latest(related_boms)
+            net = _latest(related_nets)
+            return svg, bom, net
+
+        session_svgs = [path for path in all_svgs if os.path.getmtime(path) >= (self._app_session_start_ts - 1.0)]
+        session_boms = [path for path in all_boms if os.path.getmtime(path) >= (self._app_session_start_ts - 1.0)]
+        session_nets = [path for path in all_nets if os.path.getmtime(path) >= (self._app_session_start_ts - 1.0)]
+        svg = _latest(session_svgs or all_svgs)
+        bom = _latest(session_boms or all_boms)
+        net = _latest(session_nets or all_nets)
         return svg, bom, net
 
     def _update_wiring_summary(self) -> None:
@@ -2071,12 +3614,51 @@ class WillyApp(ctk.CTk):
     # Sidebar toggle
     # ------------------------------------------------------------------
 
+    def _apply_sidebar_width(self, width: int, persist: bool = False) -> None:
+        clamped = max(180, min(360, int(width)))
+        self._sidebar_width = clamped
+        self.grid_columnconfigure(0, minsize=clamped)
+        if hasattr(self, "file_browser") and self.file_browser is not None:
+            self.file_browser.configure(width=clamped)
+
+        if persist and "sidebar_width" not in self._locked_config_keys:
+            self.config_data["sidebar_width"] = clamped
+            try:
+                self._save_config()
+            except Exception:
+                pass
+
+    def _on_sidebar_drag_start(self, _event=None) -> None:
+        self._sidebar_dragging = True
+
+    def _on_sidebar_drag_motion(self, _event=None) -> None:
+        if not self._sidebar_visible:
+            return
+        pointer_x = self.winfo_pointerx()
+        root_x = self.winfo_rootx()
+        new_width = pointer_x - root_x
+        self._apply_sidebar_width(new_width, persist=False)
+
+    def _on_sidebar_drag_end(self, _event=None) -> None:
+        if not self._sidebar_dragging:
+            return
+        self._sidebar_dragging = False
+        self._apply_sidebar_width(self._sidebar_width, persist=True)
+
     def _toggle_sidebar(self) -> None:
         if self._sidebar_visible:
             self.file_browser.grid_remove()
+            if hasattr(self, "sidebar_splitter"):
+                self.sidebar_splitter.grid_remove()
+            self.grid_columnconfigure(0, minsize=0)
+            self.grid_columnconfigure(1, minsize=0)
             self._sidebar_visible = False
         else:
             self.file_browser.grid()
+            if hasattr(self, "sidebar_splitter"):
+                self.sidebar_splitter.grid()
+            self.grid_columnconfigure(1, minsize=6)
+            self._apply_sidebar_width(self._sidebar_width, persist=False)
             self._sidebar_visible = True
 
     # ------------------------------------------------------------------

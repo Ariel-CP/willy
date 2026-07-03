@@ -609,6 +609,21 @@ class AIAgent:
         self._last_success_port = ""
         self._last_success_env = ""
         self._history_limit = int(self.config.get("max_history_messages", 60) or 60)
+        self._active_project_path = ""
+        self._active_project_info: dict = {}
+        self._project_context_cache: dict[str, dict] = {}
+        self._project_context_ttl = int(self.config.get("project_context_cache_seconds", 45) or 45)
+
+    def set_active_project_context(self, project_path: str, project_info: Optional[dict] = None) -> None:
+        """Receive project context updates from GUI to keep chat grounded."""
+        previous = self._active_project_path
+        self._active_project_path = os.path.abspath(project_path) if project_path else ""
+        self._active_project_info = project_info if isinstance(project_info, dict) else {}
+
+        if previous and previous != self._active_project_path:
+            self._project_context_cache.pop(previous, None)
+        if self._active_project_path:
+            self._project_context_cache.pop(self._active_project_path, None)
 
     def _emit_progress(self, percent: float, detail: str = "") -> None:
         """Send monotonic progress updates to the UI (0-100)."""
@@ -632,9 +647,9 @@ class AIAgent:
     # Public
     # ------------------------------------------------------------------
 
-    def send(self, user_text: str) -> None:
+    def send(self, user_text: str, mode: str = "agent") -> None:
         """Process a user message asynchronously."""
-        threading.Thread(target=self._process, args=(user_text,), daemon=True).start()
+        threading.Thread(target=self._process, args=(user_text, mode), daemon=True).start()
 
     def clear_history(self) -> None:
         self.runtime_context = self._detect_runtime_context()
@@ -741,6 +756,288 @@ class AIAgent:
         )
         return has_plan_word and has_numbered_steps and asks_confirmation
 
+    def _is_project_explanation_request(self, user_text: str) -> bool:
+        text = (user_text or "").lower()
+        if not text:
+            return False
+
+        explanation_markers = [
+            "que hace",
+            "que hace este proyecto",
+            "que hace el proyecto",
+            "que hace este codigo",
+            "que hace este entorno",
+            "explica",
+            "resumen",
+            "de que trata",
+            "para que sirve",
+            "que hace esta carpeta",
+            "qué hace",
+            "de qué trata",
+            "para qué sirve",
+        ]
+        return any(marker in text for marker in explanation_markers)
+
+    def _parse_project_agents_markdown(self, content: str) -> dict[str, str]:
+        """Parse key sections from a project AGENTS markdown file."""
+        sections: dict[str, str] = {}
+        current = ""
+        buffer: list[str] = []
+
+        for raw_line in (content or "").splitlines():
+            line = raw_line.rstrip("\n")
+            if line.lstrip().startswith("#"):
+                if current:
+                    sections[current] = "\n".join(buffer).strip()
+                current = re.sub(r"^#+\s*", "", line).strip().lower()
+                buffer = []
+                continue
+            buffer.append(line)
+
+        if current:
+            sections[current] = "\n".join(buffer).strip()
+
+        normalized = {
+            "objective": "",
+            "hardware": "",
+            "rules": "",
+        }
+
+        for heading, body in sections.items():
+            heading_l = heading.lower()
+            if not normalized["objective"] and any(token in heading_l for token in ("objetivo", "objective", "meta", "goal")):
+                normalized["objective"] = body
+            elif not normalized["hardware"] and any(token in heading_l for token in ("hardware", "component", "componentes", "material", "placa", "board")):
+                normalized["hardware"] = body
+            elif not normalized["rules"] and any(token in heading_l for token in ("regla", "rule", "instruccion", "instruction", "estilo", "style")):
+                normalized["rules"] = body
+
+        # Fallback: accept inline label formats, e.g.:
+        # - **Objetivo:** ...
+        # - Objetivo: ...
+        if content and (not normalized["objective"] or not normalized["hardware"] or not normalized["rules"]):
+            for raw_line in content.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                clean = line.lstrip("-* ").strip()
+                clean = re.sub(r"^\*\*(.+?)\*\*\s*:?[ \t]*", r"\1: ", clean)
+
+                low = clean.lower()
+                if not normalized["objective"] and (low.startswith("objetivo:") or low.startswith("objective:") or low.startswith("goal:")):
+                    normalized["objective"] = clean.split(":", 1)[1].strip()
+                elif not normalized["hardware"] and (low.startswith("hardware:") or low.startswith("componentes:") or low.startswith("components:") or low.startswith("placa:")):
+                    normalized["hardware"] = clean.split(":", 1)[1].strip()
+                elif not normalized["rules"] and (low.startswith("reglas:") or low.startswith("rules:") or low.startswith("instrucciones:")):
+                    normalized["rules"] = clean.split(":", 1)[1].strip()
+
+        if not normalized["objective"]:
+            for paragraph in re.split(r"\n\s*\n", content or ""):
+                candidate = paragraph.strip()
+                if candidate:
+                    normalized["objective"] = candidate[:500]
+                    break
+
+        return normalized
+
+    def _find_project_source_file(self, project_path: str) -> str:
+        """Return the most relevant firmware source file for project context."""
+        root = os.path.abspath(project_path or "")
+        if not root:
+            return ""
+
+        candidates = [
+            os.path.join(root, "src", "main.cpp"),
+            os.path.join(root, "main.cpp"),
+            os.path.join(root, "src", "main.ino"),
+            os.path.join(root, "main.ino"),
+        ]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+
+        src_dir = os.path.join(root, "src")
+        if os.path.isdir(src_dir):
+            try:
+                src_entries = sorted(os.listdir(src_dir))
+            except Exception:
+                src_entries = []
+            for name in src_entries:
+                if name.lower().endswith((".cpp", ".ino", ".c", ".h", ".hpp")):
+                    path = os.path.join(src_dir, name)
+                    if os.path.isfile(path):
+                        return path
+
+        try:
+            root_entries = sorted(os.listdir(root))
+        except Exception:
+            root_entries = []
+        for name in root_entries:
+            if name.lower().endswith(".ino"):
+                path = os.path.join(root, name)
+                if os.path.isfile(path):
+                    return path
+
+        return ""
+
+    def _get_project_context_payload(self, project_path: str) -> dict:
+        """Build and cache project context payload used by chat hints."""
+        path = os.path.abspath(project_path or "")
+        if not path:
+            return {}
+
+        now = time.time()
+        cached = self._project_context_cache.get(path)
+        if cached and (now - float(cached.get("ts", 0.0))) < self._project_context_ttl:
+            return dict(cached.get("payload", {}))
+
+        info: dict = {}
+        if path == self._active_project_path and isinstance(self._active_project_info, dict):
+            info = dict(self._active_project_info)
+        elif self.arduino_manager is not None:
+            try:
+                info = self.arduino_manager.get_project_info(path)
+            except Exception:
+                info = {}
+
+        envs = []
+        default_env = ""
+        if isinstance(info, dict) and info.get("ok"):
+            envs = [str(item).strip() for item in info.get("environments", []) if str(item).strip()]
+            default_env = str(info.get("default_env") or "").strip()
+        env_label = default_env or (envs[0] if envs else "(sin env)")
+
+        agents_candidates = [
+            os.path.join(path, ".willy", "AGENTS.md"),
+            os.path.join(path, "AGENTS.md"),
+        ]
+        agents_path = ""
+        agents_content = ""
+        for candidate in agents_candidates:
+            if os.path.isfile(candidate):
+                agents_path = candidate
+                try:
+                    with open(candidate, "r", encoding="utf-8", errors="replace") as fh:
+                        agents_content = fh.read(16000)
+                except Exception:
+                    agents_content = ""
+                break
+
+        parsed_agents = self._parse_project_agents_markdown(agents_content)
+        objective = (parsed_agents.get("objective") or "").strip()
+        hardware = (parsed_agents.get("hardware") or "").strip()
+        rules = (parsed_agents.get("rules") or "").strip()
+
+        payload = {
+            "project_path": path,
+            "env_label": env_label,
+            "agents_exists": bool(agents_path),
+            "agents_path": agents_path,
+            "objective": objective,
+            "hardware": hardware,
+            "rules": rules,
+        }
+        self._project_context_cache[path] = {
+            "ts": now,
+            "payload": payload,
+        }
+        return dict(payload)
+
+    @staticmethod
+    def _single_line(text: str, max_chars: int = 360) -> str:
+        compact = re.sub(r"\s+", " ", (text or "").strip())
+        if len(compact) <= max_chars:
+            return compact
+        return compact[: max_chars - 3].rstrip() + "..."
+
+    def _summarize_main_cpp(self, source: str) -> dict:
+        summary = {
+            "has_setup": False,
+            "has_loop": False,
+            "includes": [],
+            "signals": [],
+        }
+        if not source:
+            return summary
+
+        summary["has_setup"] = bool(re.search(r"\bsetup\s*\(", source))
+        summary["has_loop"] = bool(re.search(r"\bloop\s*\(", source))
+
+        includes = re.findall(r"#include\s*<([^>]+)>", source)
+        summary["includes"] = includes[:6]
+
+        signal_patterns = [
+            (r"digitalWrite\s*\(", "digitalWrite"),
+            (r"digitalRead\s*\(", "digitalRead"),
+            (r"analogWrite\s*\(", "analogWrite"),
+            (r"analogRead\s*\(", "analogRead"),
+            (r"delay\s*\(", "delay"),
+            (r"millis\s*\(", "millis"),
+            (r"Serial\.begin\s*\(", "Serial.begin"),
+            (r"Wire\.begin\s*\(", "Wire.begin"),
+            (r"pinMode\s*\(", "pinMode"),
+        ]
+        signals: list[str] = []
+        for pattern, label in signal_patterns:
+            if re.search(pattern, source):
+                signals.append(label)
+        summary["signals"] = signals
+        return summary
+
+    def _build_project_context_hint_for_user_query(self, user_text: str) -> str:
+        """Inject high-signal project context in all turns with richer detail on explanatory asks."""
+        project_path, _note = self._resolve_iot_project_path("")
+        if not project_path:
+            return ""
+
+        context = self._get_project_context_payload(project_path)
+        env_label = context.get("env_label", "(sin env)")
+        agents_exists = bool(context.get("agents_exists"))
+        objective = self._single_line(context.get("objective", ""), max_chars=320)
+        hardware = self._single_line(context.get("hardware", ""), max_chars=320)
+        rules = self._single_line(context.get("rules", ""), max_chars=320)
+
+        agents_hint = (
+            "\n\n[CONTEXTO_PROYECTO_ACTIVO]\n"
+            f"project_path={project_path}\n"
+            f"env_default={env_label}\n"
+            f"agents_file={'si' if agents_exists else 'no'}\n"
+            f"agents_path={context.get('agents_path', '(sin archivo)')}\n"
+            f"objetivo={objective or '(no definido en AGENTS.md)'}\n"
+            f"hardware={hardware or '(no definido en AGENTS.md)'}\n"
+            f"reglas={rules or '(no definidas en AGENTS.md)'}\n"
+            "INSTRUCCION: usa este contexto como fuente principal para responder en chat."
+        )
+
+        if not self._is_project_explanation_request(user_text):
+            return agents_hint
+
+        source_file = self._find_project_source_file(project_path)
+        source = ""
+        if source_file and os.path.isfile(source_file):
+            try:
+                with open(source_file, "r", encoding="utf-8", errors="replace") as fh:
+                    source = fh.read(12000)
+            except Exception:
+                source = ""
+
+        code_summary = self._summarize_main_cpp(source)
+        includes_label = ", ".join(code_summary["includes"]) if code_summary["includes"] else "(sin includes detectados)"
+        signals_label = ", ".join(code_summary["signals"]) if code_summary["signals"] else "(sin acciones detectadas)"
+
+        auto_hint = (
+            "\n\n[CONTEXTO_AUTOMATICO_PROYECTO]\n"
+            f"platformio_ini={'si' if os.path.isfile(os.path.join(project_path, 'platformio.ini')) else 'no'}\n"
+            f"source_file={source_file or '(no detectado)'}\n"
+            f"main_cpp={'si' if bool(source_file) else 'no'}\n"
+            f"includes={includes_label}\n"
+            f"signals={signals_label}\n"
+            f"setup_detected={'si' if code_summary['has_setup'] else 'no'}\n"
+            f"loop_detected={'si' if code_summary['has_loop'] else 'no'}\n"
+            "INSTRUCCION: si el usuario pregunta que hace el proyecto/entorno, explica objetivo y comportamiento del firmware real."
+        )
+        return agents_hint + auto_hint
+
     def _format_plan_display(self, steps: list[str]) -> str:
         """Format plan steps for display."""
         if not steps:
@@ -749,6 +1046,20 @@ class AIAgent:
         for i, step in enumerate(steps, 1):
             lines.append(f"{i}. {step}")
         return "\n".join(lines)
+
+    def _normalize_plan_text_for_chat(self, text: str) -> str:
+        """Convert XML-like plans to a readable list for chat output."""
+        if not text:
+            return text
+
+        steps = self._extract_plan_steps(text)
+        if steps:
+            return self._format_plan_display(steps)
+
+        cleaned = re.sub(r"</?plan[^>]*>", "", text, flags=re.IGNORECASE)
+        cleaned = re.sub(r"</?step[^>]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned or text
 
     def _request_plan_confirmation(self, steps: list[str]) -> bool:
         """Request user confirmation for plan execution. Returns True if confirmed."""
@@ -776,32 +1087,80 @@ class AIAgent:
         
         return confirmed
 
-    def _process(self, user_text: str) -> None:
-        self._append_history({"role": "user", "content": user_text})
+    def _process(self, user_text: str, mode: str = "agent") -> None:
+        mode_l = (mode or "agent").strip().lower()
+        if mode_l not in {"ask", "plan", "agent"}:
+            mode_l = "agent"
+
+        raw_user_text = user_text
+        project_hint = self._build_project_context_hint_for_user_query(raw_user_text)
+        effective_user_text = f"{raw_user_text}{project_hint}" if project_hint else raw_user_text
+
+        if mode_l == "plan":
+            effective_user_text = (
+                f"{effective_user_text}\n\n"
+                "[CHAT_MODE_PLAN]\n"
+                "Responde con un plan profesional, legible y accionable en espanol.\n"
+                "Formato: lista numerada breve de pasos (sin XML, sin etiquetas).\n"
+                "Si el pedido incluye hardware + firmware, incluye explicitamente: conexion electrica y programa.\n"
+                "No ejecutes herramientas. No propongas ejecucion inmediata."
+            )
+        elif mode_l == "ask":
+            effective_user_text = (
+                f"{effective_user_text}\n\n"
+                "[CHAT_MODE_ASK]\n"
+                "Responde de forma explicativa y concisa. No ejecutes herramientas."
+            )
+
+        self._append_history({"role": "user", "content": effective_user_text})
         self.on_status(i18n.get("ai_thinking"))
         self._progress_value = 0.0
         self._emit_progress(5, "Analizando solicitud")
         tool_attempts: dict[str, int] = {}
         failed_tool_fingerprints: set[str] = set()
+        plan_only_turns = 0
+        plan_execution_requested = False
         try:
             client = self._get_client()
             model = self.config.get("model", "gpt-4o")
+            request_timeout_s = float(self.config.get("model_timeout_seconds", 90) or 90)
+            max_agent_rounds = int(self.config.get("agent_max_rounds", 8) or 8)
             recovered_bad_history = False
             # Agentic loop: keep going until no more tool calls
+            round_idx = 0
             while True:
+                round_idx += 1
+                if round_idx > max_agent_rounds:
+                    self.on_message(
+                        "system",
+                        "Se alcanzo el limite de iteraciones del modo agente. "
+                        "Detuve la ejecucion para evitar cuelgue. "
+                        "Podemos continuar con una instruccion mas especifica.",
+                    )
+                    self._emit_progress(100, "Completado")
+                    break
+
                 self._emit_progress(12, "Consultando modelo")
                 try:
-                    response = client.chat.completions.create(
-                        model=model,
-                        messages=self.history,
-                        tools=TOOLS,
-                        tool_choice="auto",
-                    )
+                    if mode_l == "agent":
+                        response = client.chat.completions.create(
+                            model=model,
+                            messages=self.history,
+                            tools=TOOLS,
+                            tool_choice="auto",
+                            timeout=request_timeout_s,
+                        )
+                    else:
+                        response = client.chat.completions.create(
+                            model=model,
+                            messages=self.history,
+                            timeout=request_timeout_s,
+                        )
                 except openai.BadRequestError as exc:
                     err_text = str(exc)
                     self._log_event("bad_request", {
                         "error": err_text,
-                        "user_text": user_text,
+                        "user_text": raw_user_text,
                     })
                     # Recover once if history was left with dangling tool calls.
                     if (
@@ -811,7 +1170,7 @@ class AIAgent:
                         recovered_bad_history = True
                         self.history = [
                             {"role": "system", "content": self.system_prompt},
-                            {"role": "user", "content": user_text},
+                            {"role": "user", "content": effective_user_text},
                         ]
                         self.on_message(
                             "system",
@@ -819,6 +1178,14 @@ class AIAgent:
                         )
                         continue
                     raise
+                except openai.APITimeoutError:
+                    self.on_message(
+                        "error",
+                        "Timeout consultando el modelo en modo agente. "
+                        "Intenta nuevamente o divide la tarea en pasos mas cortos.",
+                    )
+                    self._emit_progress(100, "Completado con timeout")
+                    break
 
                 msg = response.choices[0].message
                 self._append_history(msg.to_dict())
@@ -827,17 +1194,19 @@ class AIAgent:
                 assistant_text = msg.content or ""
                 assistant_text = self._sanitize_assistant_text(
                     assistant_text,
-                    user_text,
+                    raw_user_text,
                 )
                 is_plan_text = False
                 plan_cancelled = False
                 if assistant_text:
                     is_plan_text = self._has_plan(assistant_text) or self._looks_like_textual_plan(assistant_text)
 
-                if assistant_text and is_plan_text:
+                if assistant_text and is_plan_text and mode_l == "agent":
                     self._emit_progress(25, "Plan detectado")
-                    # Show the plan message first
-                    self._emit_assistant_once(assistant_text)
+                    # Show a readable version of the detected plan.
+                    self._emit_assistant_once(
+                        self._normalize_plan_text_for_chat(assistant_text)
+                    )
                     
                     # Extract plan steps
                     plan_steps = self._extract_plan_steps(assistant_text)
@@ -847,6 +1216,7 @@ class AIAgent:
                         # Request confirmation for the plan
                         if self._request_plan_confirmation(plan_steps):
                             self._emit_progress(35, "Plan confirmado")
+                            plan_execution_requested = True
                             # User confirmed — set flag to skip confirmations for next commands
                             self.awaiting_plan_confirmation = False
                             # Force immediate execution on next loop (avoid re-planning loop).
@@ -862,12 +1232,23 @@ class AIAgent:
                     # If this response only contained plan text, request another turn.
                     # If it also contains tool_calls, do NOT skip tool processing.
                     if not msg.tool_calls:
+                        plan_only_turns += 1
+                        if plan_execution_requested and plan_only_turns >= 2:
+                            self.on_message(
+                                "system",
+                                "No pude pasar del plan a ejecucion automatica. "
+                                "Probemos con una instruccion concreta (por ejemplo: 'ejecuta compilacion del proyecto activo') "
+                                "o vuelve a modo Plan para refinar pasos.",
+                            )
+                            self._emit_progress(100, "Completado")
+                            break
                         continue
 
                 if plan_cancelled:
                     break
 
                 if msg.tool_calls:
+                    plan_only_turns = 0
                     # Process each tool call
                     total_calls = max(1, len(msg.tool_calls))
                     for idx, tc in enumerate(msg.tool_calls, start=1):
@@ -911,8 +1292,11 @@ class AIAgent:
                     continue
 
                 # No tool calls — final text response
-                if assistant_text and not is_plan_text:
-                    self._emit_assistant_once(assistant_text)
+                if assistant_text and (mode_l != "agent" or not is_plan_text):
+                    display_text = assistant_text
+                    if is_plan_text:
+                        display_text = self._normalize_plan_text_for_chat(assistant_text)
+                    self._emit_assistant_once(display_text)
                 self._emit_progress(100, "Completado")
                 break
 
@@ -947,6 +1331,38 @@ class AIAgent:
         if user_explicitly_wants_ide:
             return text
 
+        # Do not sanitize normal explanatory intents about the project/code.
+        user_project_explanation_intent = (
+            "que hace" in user_l
+            or "qué hace" in user_l
+            or "explica" in user_l
+            or "resumen" in user_l
+            or "de que trata" in user_l
+            or "de qué trata" in user_l
+            or "pseudocod" in user_l
+            or "diagrama" in user_l
+        )
+        if user_project_explanation_intent:
+            return text
+
+        # Only sanitize when the user is actually asking for dependency/install diagnostics.
+        user_dependency_context = (
+            "librer" in user_l
+            or "dependency" in user_l
+            or "dependencia" in user_l
+            or "platformio" in user_l
+            or "compil" in user_l
+            or "upload" in user_l
+            or "grabar" in user_l
+            or "error" in user_l
+            or "fallo" in user_l
+            or "diagnost" in user_l
+            or "correg" in user_l
+            or "instal" in user_l
+        )
+        if not user_dependency_context:
+            return text
+
         has_manual_ide_flow = (
             "arduino ide" in text_l
             and (
@@ -972,7 +1388,15 @@ class AIAgent:
             or "platformio" in text_l
         )
 
-        if (has_manual_ide_flow or has_manual_platformio_dep_flow) and has_dependency_context:
+        user_prefers_auto_flow = (
+            "automatic" in user_l
+            or "automático" in user_l
+            or "sin manual" in user_l
+            or "solo platformio" in user_l
+            or "no manual" in user_l
+        )
+
+        if user_prefers_auto_flow and (has_manual_ide_flow or has_manual_platformio_dep_flow) and has_dependency_context:
             return (
                 "Se omitieron pasos manuales de librerías para evitar desviar el flujo.\n"
                 "Continuemos con diagnóstico y corrección automática en PlatformIO mostrando salida técnica completa."
@@ -1317,6 +1741,8 @@ class AIAgent:
         content = args.get("content", "")
         path = self._resolve_path(raw_path)
 
+        content = self._normalize_write_content(path, content)
+
         # Always confirm writes
         confirmed_event = threading.Event()
         decision: list[bool] = []
@@ -1351,6 +1777,36 @@ class AIAgent:
             return f"Error: permission denied writing to {path}"
         except Exception as exc:  # noqa: BLE001
             return f"Error writing file: {exc}"
+
+    def _normalize_write_content(self, path: str, content: str) -> str:
+        """Best-effort normalization for model-generated escaped multiline content."""
+        if not isinstance(content, str):
+            return str(content)
+
+        # If it already contains real line breaks, keep it unchanged.
+        if "\n" in content:
+            return content
+
+        escaped_newline_count = content.count("\\n") + content.count("\\r\\n")
+        if escaped_newline_count < 2:
+            return content
+
+        # Restrict auto-fix to source/config text files where multiline is expected.
+        lower_path = (path or "").lower()
+        multiline_exts = (
+            ".cpp", ".c", ".h", ".hpp", ".ino", ".py", ".md",
+            ".txt", ".ini", ".json", ".yaml", ".yml",
+        )
+        if not lower_path.endswith(multiline_exts):
+            return content
+
+        # Preserve explicit backslashes first, then decode common escaped newlines/tabs.
+        fixed = content
+        fixed = fixed.replace("\\r\\n", "\n")
+        fixed = fixed.replace("\\n", "\n")
+        fixed = fixed.replace("\\t", "\t")
+
+        return fixed
 
     def _tool_list_directory(self, args: dict) -> str:
         raw_path = args.get("path", self.tm.get_cwd()).strip() or self.tm.get_cwd()
@@ -1522,6 +1978,7 @@ class AIAgent:
             return self._resolve_path(raw), ""
 
         candidates = [
+            self._active_project_path,
             self._last_success_project_path,
             str(self.config.get("initial_directory", "")).strip(),
             self.tm.get_cwd(),

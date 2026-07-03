@@ -34,7 +34,7 @@ LIBRARY_RULES: Dict[str, Dict[str, object]] = {
     },
     "liquidcrystal_i2c": {
         "include_tokens": ["liquidcrystal_i2c.h"],
-        "canonical": "marcoschwartz/LiquidCrystal_I2C@1.1.4",
+        "canonical": "marcoschwartz/LiquidCrystal_I2C",
         "aliases": [
             "johnrickman/LiquidCrystal_I2C@^1.1.4",
             "johnrickman/LiquidCrystal_I2C@1.1.4",
@@ -48,7 +48,7 @@ LIBRARY_RULES: Dict[str, Dict[str, object]] = {
             "marcoschwartz/LiquidCrystal_I2C",
             "fdebrabander/Arduino-LiquidCrystal-I2C-library",
         ],
-        "fallback_versions": ["1.1.3", "1.1.2", "latest"],
+        "fallback_versions": ["latest"],
     },
     "dht": {
         "include_tokens": ["dht.h", "dht_u.h"],
@@ -739,6 +739,107 @@ class ArduinoManager:
                 f"Details:\n{error_detail}",
             )
         return False, messages, "Preflight package install failed after automatic retries."
+
+    def install_declared_dependencies(
+        self,
+        project_path: str,
+        env: Optional[str] = None,
+    ) -> Dict:
+        """Install declared PlatformIO dependencies for a project."""
+        if not self.platformio_path:
+            return {
+                "ok": False,
+                "error": "PlatformIO no está disponible.",
+                "output": "",
+            }
+
+        ok, messages, error = self._sync_dependencies_with_recovery(
+            project_path,
+            env=env,
+        )
+        return {
+            "ok": ok,
+            "error": error,
+            "output": "\n".join(messages).strip(),
+        }
+
+    def search_libraries(self, query: str, max_results: int = 8) -> Dict:
+        """Search PlatformIO registry libraries by natural query."""
+        if not self.platformio_path:
+            return {
+                "ok": False,
+                "error": "PlatformIO no está disponible.",
+                "results": [],
+            }
+
+        search_query = (query or "").strip()
+        if not search_query:
+            return {
+                "ok": True,
+                "error": "",
+                "results": [],
+            }
+
+        try:
+            result = subprocess.run(
+                [self.platformio_path, "pkg", "search", "-s", "relevance", search_query],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "error": "La búsqueda de librerías agotó el tiempo de espera.",
+                "results": [],
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "error": str(exc),
+                "results": [],
+            }
+
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "error": output.strip() or "Búsqueda de librerías fallida.",
+                "results": [],
+            }
+
+        blocks = [block.strip() for block in re.split(r"\n\s*\n", output) if block.strip()]
+        results: List[Dict[str, str]] = []
+        for block in blocks:
+            if block.lower().startswith("found "):
+                continue
+            lines = [line.strip() for line in block.splitlines() if line.strip()]
+            if len(lines) < 2:
+                continue
+
+            package_name = lines[0]
+            metadata_line = lines[1]
+            description = " ".join(lines[2:]).strip()
+
+            version_match = re.search(r"Library\s+•\s+([^•]+)", metadata_line)
+            version = version_match.group(1).strip() if version_match else ""
+
+            results.append(
+                {
+                    "spec": f"{package_name}@{version}" if version else package_name,
+                    "name": package_name,
+                    "version": version,
+                    "description": description,
+                }
+            )
+            if len(results) >= max_results:
+                break
+
+        return {
+            "ok": True,
+            "error": "",
+            "results": results,
+        }
 
     def _run_pkg_install_once(
         self,

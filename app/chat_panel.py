@@ -2,10 +2,14 @@
 chat_panel.py — Left panel: chat history + input + confirmation dialogs.
 """
 
+import logging
 import tkinter as tk
 import customtkinter as ctk
 from typing import Callable
 from app import i18n
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -106,14 +110,89 @@ CODE_FG = ("#1a1a2e", "#cdd6f4")
 class ChatPanel(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
-        self._send_callback: Callable[[str], None] | None = None
+        self._send_callback: Callable[..., None] | None = None
         self._tts_callback: Callable[[str], None] | None = None
         self._tts_on = False  # default, overwritten in _build_ui
         self._vol_callback: Callable[[float], None] | None = None
         self._input_min_height = 36
         self._input_max_height = 220
         self._input_resize_after_id = None
+        self._bubble_resize_after_id = None
+        self._text_bubbles: list[ctk.CTkTextbox] = []
+        self._last_chat_width = 0
+        self._msg_row = 0
+        self._is_fullscreen = False
+        self._wheel_scroll_units = 6
+        self._pending_scroll_job = None
+        self._chat_mode_map = {
+            i18n.get("chat_mode_ask"): "ask",
+            i18n.get("chat_mode_plan"): "plan",
+            i18n.get("chat_mode_agent"): "agent",
+        }
+        self._chat_mode_var = tk.StringVar(value=i18n.get("chat_mode_agent"))
         self._build_ui()
+
+    def _get_scroll_canvas(self):
+        """Return the internal canvas used by CTkScrollableFrame."""
+        canvas = getattr(self.scroll_frame, "_parent_canvas", None)
+        if canvas is not None:
+            return canvas
+
+        canvas = getattr(self.scroll_frame, "_canvas", None)
+        if canvas is not None:
+            return canvas
+
+        for child in self.scroll_frame.winfo_children():
+            if isinstance(child, tk.Canvas):
+                return child
+        return None
+
+    def _bind_widget_scroll(self, widget) -> None:
+        """Bind mouse wheel events so chat scroll works over message widgets."""
+        if widget is None:
+            return
+        try:
+            widget.bind("<MouseWheel>", self._on_mousewheel, add="+")
+            widget.bind("<Button-4>", self._on_mousewheel, add="+")
+            widget.bind("<Button-5>", self._on_mousewheel, add="+")
+        except Exception:
+            pass
+
+    def _on_mousewheel(self, event) -> str:
+        canvas = self._get_scroll_canvas()
+        if canvas is None:
+            return "break"
+
+        delta = getattr(event, "delta", 0)
+        num = getattr(event, "num", None)
+
+        if delta:
+            units = -int(delta / 120)
+            if units == 0:
+                units = -1 if delta > 0 else 1
+            canvas.yview_scroll(units * self._wheel_scroll_units, "units")
+        elif num == 4:
+            canvas.yview_scroll(-self._wheel_scroll_units, "units")
+        elif num == 5:
+            canvas.yview_scroll(self._wheel_scroll_units, "units")
+        return "break"
+
+    def _schedule_scroll_to_bottom(self) -> None:
+        """Schedule a robust scroll-to-bottom after UI layout settles."""
+        if self._pending_scroll_job is not None:
+            try:
+                self.after_cancel(self._pending_scroll_job)
+            except Exception:
+                pass
+
+        def _run() -> None:
+            self._pending_scroll_job = None
+            self._scroll_to_bottom()
+            # Run a second/third pass to catch late geometry updates.
+            self.after(70, self._scroll_to_bottom)
+            self.after(160, self._scroll_to_bottom)
+
+        self._pending_scroll_job = self.after(10, _run)
 
     def _build_ui(self) -> None:
         self.grid_rowconfigure(1, weight=1)
@@ -139,6 +218,20 @@ class ChatPanel(ctk.CTkFrame):
         )
         self.status_label.grid(row=0, column=1, padx=4, pady=6, sticky="ew")
 
+        self.chat_mode_menu = ctk.CTkOptionMenu(
+            header,
+            values=list(self._chat_mode_map.keys()),
+            variable=self._chat_mode_var,
+            width=92,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color=("gray70", "gray35"),
+            button_color=("gray65", "gray40"),
+            button_hover_color=("gray60", "gray45"),
+            dropdown_font=ctk.CTkFont(size=11),
+        )
+        self.chat_mode_menu.grid(row=0, column=2, padx=(0, 4), pady=6)
+
         ctk.CTkButton(
             header,
             text=i18n.get("new_chat_btn"),
@@ -148,7 +241,7 @@ class ChatPanel(ctk.CTkFrame):
             fg_color=("gray70", "gray35"),
             hover_color=("gray60", "gray45"),
             command=self._clear_chat,
-        ).grid(row=0, column=2, padx=(0, 4), pady=6)
+        ).grid(row=0, column=3, padx=(0, 4), pady=6)
 
         self._fullscreen_btn = ctk.CTkButton(
             header,
@@ -160,8 +253,7 @@ class ChatPanel(ctk.CTkFrame):
             hover_color=("gray70", "gray30"),
             command=self._toggle_fullscreen,
         )
-        self._fullscreen_btn.grid(row=0, column=3, padx=(0, 4), pady=6)
-        self._is_fullscreen = False
+        self._fullscreen_btn.grid(row=0, column=4, padx=(0, 4), pady=6)
 
         self._tts_btn = ctk.CTkButton(
             header,
@@ -173,7 +265,7 @@ class ChatPanel(ctk.CTkFrame):
             hover_color=("gray60", "gray45"),
             command=self._toggle_tts,
         )
-        self._tts_btn.grid(row=0, column=4, padx=(0, 2), pady=6)
+        self._tts_btn.grid(row=0, column=5, padx=(0, 2), pady=6)
         self._tts_on = False
 
         self._vol_slider = ctk.CTkSlider(
@@ -185,7 +277,7 @@ class ChatPanel(ctk.CTkFrame):
             command=self._on_volume_change,
         )
         self._vol_slider.set(0.35)
-        self._vol_slider.grid(row=0, column=5, padx=(0, 8), pady=6)
+        self._vol_slider.grid(row=0, column=6, padx=(0, 8), pady=6)
 
         self.scroll_frame = ctk.CTkScrollableFrame(
             self,
@@ -194,7 +286,8 @@ class ChatPanel(ctk.CTkFrame):
         )
         self.scroll_frame.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
         self.scroll_frame.grid_columnconfigure(0, weight=1)
-        self._msg_row = 0
+        self.scroll_frame.bind("<Configure>", self._on_chat_resized)
+        self._bind_widget_scroll(self.scroll_frame)
 
         input_frame = ctk.CTkFrame(self, fg_color=("gray90", "gray15"))
         input_frame.grid(row=2, column=0, sticky="ew")
@@ -225,8 +318,12 @@ class ChatPanel(ctk.CTkFrame):
         ).grid(row=0, column=1, padx=(0, 8), pady=6)
         self._auto_resize_input_box()
 
-    def set_send_callback(self, cb: Callable[[str], None]) -> None:
+    def set_send_callback(self, cb: Callable[..., None]) -> None:
         self._send_callback = cb
+
+    def get_chat_mode(self) -> str:
+        selected = (self._chat_mode_var.get() or "").strip()
+        return self._chat_mode_map.get(selected, "agent")
 
     def set_tts_callback(self, cb: Callable[[str], None]) -> None:
         """Register callback that speaks a text string."""
@@ -238,9 +335,20 @@ class ChatPanel(ctk.CTkFrame):
 
     def add_message(self, role: str, text: str) -> None:
         """Add a chat bubble (thread-safe via after)."""
-        self.after(0, self._add_bubble, role, text)
+        safe_role = role if isinstance(role, str) else "system"
+        safe_text = text if isinstance(text, str) else str(text)
+        try:
+            if not self.winfo_exists():
+                return
+            self.after(0, self._add_bubble, safe_role, safe_text)
+        except Exception as exc:
+            logger.debug("Skipping add_message because chat is closing: %s", exc)
+            return
         if role == "assistant" and self._tts_on and callable(self._tts_callback):
-            self.after(0, self._tts_callback, text)
+            try:
+                self.after(0, self._tts_callback, text)
+            except Exception as exc:
+                logger.debug("TTS callback skipped: %s", exc)
 
     def set_status(self, text: str) -> None:
         self.after(0, self.status_label.configure, {"text": text})
@@ -250,15 +358,42 @@ class ChatPanel(ctk.CTkFrame):
         self.after(0, self._open_confirm_dialog, title, detail, callback)
 
     def _add_bubble(self, role: str, text: str) -> None:
-        style = BUBBLE_STYLES.get(role, BUBBLE_STYLES["system"])
-        is_right = style["align"] == "right"
+        try:
+            style = BUBBLE_STYLES.get(role, BUBBLE_STYLES["system"])
+            is_right = style["align"] == "right"
 
+            outer = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
+            outer.grid(row=self._msg_row, column=0, sticky="ew", padx=8, pady=4)
+            outer.grid_columnconfigure(0, weight=1)
+            self._msg_row += 1
+
+            # Role label
+            role_label = {"user": "Vos", "assistant": "Willy", "error": "Error", "system": "Sistema"}
+            ctk.CTkLabel(
+                outer,
+                text=role_label.get(role, role),
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color=("gray50", "gray60"),
+                anchor="e" if is_right else "w",
+            ).grid(row=0, column=0, sticky="e" if is_right else "w", padx=4, pady=(0, 2))
+            self._bind_widget_scroll(outer)
+
+            # Render segments: plain text and ```code``` blocks
+            self._render_segments(outer, text, style, is_right)
+            self.after(20, self._finalize_message_layout)
+        except Exception as exc:
+            logger.exception("Chat bubble render failed: %s", exc)
+            self._add_fallback_bubble(role, text)
+
+    def _add_fallback_bubble(self, role: str, text: str) -> None:
+        """Safe fallback renderer used if rich bubble rendering fails."""
+        style = BUBBLE_STYLES.get(role, BUBBLE_STYLES["system"])
+        is_right = style.get("align") == "right"
         outer = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
         outer.grid(row=self._msg_row, column=0, sticky="ew", padx=8, pady=4)
         outer.grid_columnconfigure(0, weight=1)
         self._msg_row += 1
 
-        # Role label
         role_label = {"user": "Vos", "assistant": "Willy", "error": "Error", "system": "Sistema"}
         ctk.CTkLabel(
             outer,
@@ -268,10 +403,28 @@ class ChatPanel(ctk.CTkFrame):
             anchor="e" if is_right else "w",
         ).grid(row=0, column=0, sticky="e" if is_right else "w", padx=4, pady=(0, 2))
 
-        # Render segments: plain text and ```code``` blocks
-        self._render_segments(outer, text, style, is_right)
-
-        self.after(50, self._scroll_to_bottom)
+        label = ctk.CTkLabel(
+            outer,
+            text=(text or "").strip() or "(sin contenido)",
+            justify="left",
+            anchor="w",
+            corner_radius=6,
+            fg_color=style["bg"],
+            text_color=style["fg"],
+            wraplength=max(260, self.scroll_frame.winfo_width() - 120),
+            padx=10,
+            pady=8,
+        )
+        label.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=(32 if is_right else 4, 4 if is_right else 32),
+            pady=1,
+        )
+        self._bind_widget_scroll(outer)
+        self._bind_widget_scroll(label)
+        self._schedule_scroll_to_bottom()
 
     def _render_segments(self, parent, text: str, style: dict, is_right: bool) -> None:
         """Split text on ```fences``` and render plain + code segments."""
@@ -319,26 +472,69 @@ class ChatPanel(ctk.CTkFrame):
         box.grid(row=row, column=0, sticky="ew", padx=(32 if is_right else 4, 4 if is_right else 32), pady=1)
         box.insert("0.0", text.strip("\n"))
         box.configure(state="disabled")
+        self._bind_widget_scroll(box)
 
         if not is_code:
-            # Auto-redimensionar con el conteo real de líneas visuales tras el render
-            parent.after(20, lambda b=box: self._autosize_textbox(b))
+            self._text_bubbles.append(box)
+            parent.after(20, lambda b=box: self._autosize_textbox(b, scroll=False))
 
-    def _autosize_textbox(self, box: ctk.CTkTextbox) -> None:
+    def _autosize_textbox(self, box: ctk.CTkTextbox, scroll: bool = False) -> None:
         try:
+            if not box.winfo_exists():
+                return
             box.update_idletasks()
             display_lines = int(box._textbox.count("1.0", "end", "displaylines")[0])
             new_height = max(40, display_lines * 22 + 20)
             box.configure(height=new_height)
-            self.after(10, self._scroll_to_bottom)
-        except Exception:
-            pass
+            if scroll:
+                self.after(10, self._scroll_to_bottom)
+        except AttributeError as exc:
+            logger.warning("Chat autosize unavailable: %s", exc)
+        except Exception as exc:
+            logger.debug("Chat autosize skipped: %s", exc)
+
+    def _finalize_message_layout(self) -> None:
+        self._autosize_visible_bubbles(limit_to_recent=True)
+        self._schedule_scroll_to_bottom()
 
     def _scroll_to_bottom(self) -> None:
         try:
-            self.scroll_frame._parent_canvas.yview_moveto(1.0)
-        except Exception:
-            pass
+            canvas = self._get_scroll_canvas()
+            if canvas is None:
+                logger.debug("Chat scroll canvas not available")
+                return
+            canvas.update_idletasks()
+            try:
+                region = canvas.bbox("all")
+                if region is not None:
+                    canvas.configure(scrollregion=region)
+            except Exception:
+                pass
+            canvas.yview_moveto(1.0)
+        except Exception as exc:
+            logger.debug("Chat scroll skipped: %s", exc)
+
+    def _on_chat_resized(self, _event=None) -> None:
+        width = self.scroll_frame.winfo_width()
+        if width <= 1 or width == self._last_chat_width:
+            return
+        self._last_chat_width = width
+        if self._bubble_resize_after_id is not None:
+            try:
+                self.after_cancel(self._bubble_resize_after_id)
+            except Exception:
+                pass
+        self._bubble_resize_after_id = self.after(40, self._autosize_visible_bubbles)
+
+    def _autosize_visible_bubbles(self, limit_to_recent: bool = False) -> None:
+        self._bubble_resize_after_id = None
+        try:
+            self._text_bubbles = [box for box in self._text_bubbles if box.winfo_exists()]
+            bubbles = self._text_bubbles[-6:] if limit_to_recent else self._text_bubbles
+            for box in list(bubbles):
+                self._autosize_textbox(box, scroll=False)
+        except Exception as exc:
+            logger.debug("Chat bubble resize skipped: %s", exc)
 
     def _send(self) -> None:
         text = self.input_box.get("0.0", "end").strip()
@@ -348,7 +544,19 @@ class ChatPanel(ctk.CTkFrame):
         self._auto_resize_input_box(force_min=True)
         self._add_bubble("user", text)
         if self._send_callback:
-            self._send_callback(text)
+            mode = self.get_chat_mode()
+            try:
+                self._send_callback(text, mode)
+            except TypeError:
+                # Backward compatibility with legacy callback signature.
+                try:
+                    self._send_callback(text)
+                except Exception as exc:
+                    logger.exception("Send callback failed (legacy signature): %s", exc)
+                    self._add_bubble("error", "No se pudo enviar al agente. Reintenta.")
+            except Exception as exc:
+                logger.exception("Send callback failed: %s", exc)
+                self._add_bubble("error", "No se pudo enviar al agente. Reintenta.")
 
     def _on_return(self, event) -> str:
         if not (event.state & 0x1):
@@ -395,6 +603,8 @@ class ChatPanel(ctk.CTkFrame):
     def _clear_chat(self) -> None:
         for widget in self.scroll_frame.winfo_children():
             widget.destroy()
+        self._text_bubbles.clear()
+        self._last_chat_width = 0
         self._msg_row = 0
         self._add_bubble("system", i18n.get("chat_cleared"))
 

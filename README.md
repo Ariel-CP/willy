@@ -214,6 +214,44 @@ Recomendación para entornos institucionales:
 	3. Scan I2C si aplica.
 4. Exportar auditoría al finalizar.
 
+## 8.1 Contexto por proyecto con .willy/AGENTS.md
+
+Willy ahora puede usar contexto local por proyecto para responder mejor en chat (especialmente en modo Agente).
+
+Ruta recomendada:
+
+1. `.willy/AGENTS.md`
+
+Secciones sugeridas dentro del archivo:
+
+1. `## Objetivo`
+2. `## Hardware`
+3. `## Reglas`
+
+Ejemplo mínimo:
+
+```markdown
+# AGENTS
+
+## Objetivo
+Firmware para medir distancia con HC-SR04 y mostrarla en LCD 20x4 por I2C.
+
+## Hardware
+- Arduino Uno
+- HC-SR04
+- LCD 20x4 con PCF8574T
+
+## Reglas
+- Priorizar este proyecto activo sobre ejemplos genéricos.
+- Proponer pasos ejecutables en PlatformIO.
+- Mantener respuestas técnicas y concretas.
+```
+
+Notas:
+
+1. Si falta `.willy/AGENTS.md`, Willy sigue funcionando pero avisa que falta contexto local.
+2. Al crear un proyecto nuevo desde la UI, Willy genera una plantilla inicial de `.willy/AGENTS.md`.
+
 ## 9. Testing
 
 Ejecutar pruebas principales:
